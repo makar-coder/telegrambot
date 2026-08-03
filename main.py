@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from aiohttp import web
 import aiohttp
+import yt_dlp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
@@ -58,6 +59,53 @@ async def forward_to_channel(chat_id, message_id):
         async with session.post(url, json=payload) as resp:
             return await resp.json()
 
+async def send_video(chat_id, file_path, caption="", reply_markup=None):
+    """Отправка видео файла в Telegram"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+    try:
+        async with aiohttp.ClientSession() as session:
+            with open(file_path, 'rb') as f:
+                data = aiohttp.FormData()
+                data.add_field('chat_id', str(chat_id))
+                data.add_field('caption', caption)
+                data.add_field('video', f, filename=os.path.basename(file_path))
+                if reply_markup:
+                    data.add_field('reply_markup', json.dumps(reply_markup))
+                
+                async with session.post(url, data=data) as resp:
+                    result = await resp.json()
+                    if result.get("ok"):
+                        return True
+                    else:
+                        if "file is too big" in str(result):
+                            await send_message(chat_id, f"⚠️ Файл слишком большой для Telegram (>50 МБ). Скачай его по ссылке: {file_path}")
+                            return True
+                        return False
+    except Exception as e:
+        print(f"Ошибка отправки видео: {e}")
+        return False
+
+def download_video(url):
+    """Скачивает видео с помощью yt-dlp"""
+    try:
+        ydl_opts = {
+            'format': 'best[height<=720]',
+            'outtmpl': 'downloads/%(title)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'extract_flat': False,
+        }
+        
+        os.makedirs("downloads", exist_ok=True)
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            return filename, info.get('title', 'Video')
+    except Exception as e:
+        return None, str(e)
+
 async def handle_webhook(request):
     try:
         data = await request.json()
@@ -82,29 +130,18 @@ async def handle_webhook(request):
                     f"Привет! Я помогу тебе сохранять контент и публиковать его в канале.\n\n"
                     f"<b>Что я умею:</b>\n"
                     f"✅ Сохранять видео, фото, тексты\n"
+                    f"✅ Скачивать видео с YouTube, TikTok, Instagram\n"
                     f"✅ Хранить их в библиотеке\n"
                     f"✅ Публиковать в канал\n\n"
                     f"Отправь мне ссылку на пост, видео или фото, и я сохраню его!",
                     MAIN_MENU
                 )
 
-            # Сохранение контента
-            elif text.startswith("http") or msg.get("photo") or msg.get("video") or msg.get("document"):
-                # Проверяем, есть ли контент
-                content_type = "текст"
-                content_data = text
-
-                if msg.get("photo"):
-                    content_type = "фото"
-                    content_data = msg["photo"][-1]["file_id"]
-                elif msg.get("video"):
-                    content_type = "видео"
-                    content_data = msg["video"]["file_id"]
-                elif msg.get("document"):
-                    content_type = "документ"
-                    content_data = msg["document"]["file_id"]
-
-                # Сохраняем в библиотеку
+            # Сохранение контента (фото, видео, документы)
+            elif msg.get("photo") or msg.get("video") or msg.get("document"):
+                content_type = "фото" if msg.get("photo") else "видео" if msg.get("video") else "документ"
+                content_data = msg["photo"][-1]["file_id"] if msg.get("photo") else msg["video"]["file_id"] if msg.get("video") else msg["document"]["file_id"]
+                
                 item_id = len(user_library[user_id]) + 1
                 saved_item = {
                     "id": item_id,
@@ -118,6 +155,58 @@ async def handle_webhook(request):
                     chat_id,
                     f"✅ <b>Контент сохранён!</b>\n\n"
                     f"📌 Тип: {content_type}\n"
+                    f"📁 ID: {item_id}\n"
+                    f"📦 Всего в библиотеке: {len(user_library[user_id])}",
+                    MAIN_MENU
+                )
+
+            # Обработка ссылок для скачивания видео
+            elif text and re.search(r'(youtube\.com|youtu\.be|tiktok\.com|instagram\.com)', text, re.I):
+                status_msg = await send_message(
+                    chat_id,
+                    f"⏳ Скачиваю видео с {text.split('/')[2]}... Пожалуйста, подожди."
+                )
+                
+                file_path, title = download_video(text)
+                
+                if file_path and os.path.exists(file_path):
+                    success = await send_video(chat_id, file_path, f"✅ <b>{title}</b>", MAIN_MENU)
+                    
+                    if success:
+                        await send_message(
+                            chat_id,
+                            "✅ Видео успешно отправлено! Если хочешь сохранить его в библиотеку — нажми кнопку '📥 Сохранить контент' и отправь это видео повторно.",
+                            MAIN_MENU
+                        )
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+                else:
+                    await send_message(
+                        chat_id,
+                        f"❌ Ошибка загрузки: {title}\n\n"
+                        f"Возможные причины:\n"
+                        f"• Ссылка недействительна\n"
+                        f"• Видео недоступно\n"
+                        f"• Нужен cookies.txt для платформы (TikTok, Instagram)",
+                        MAIN_MENU
+                    )
+
+            elif text.startswith("http"):
+                item_id = len(user_library[user_id]) + 1
+                saved_item = {
+                    "id": item_id,
+                    "type": "ссылка",
+                    "data": text,
+                    "timestamp": datetime.now().isoformat()
+                }
+                user_library[user_id].append(saved_item)
+
+                await send_message(
+                    chat_id,
+                    f"✅ <b>Ссылка сохранена!</b>\n\n"
+                    f"📌 Тип: ссылка\n"
                     f"📁 ID: {item_id}\n"
                     f"📦 Всего в библиотеке: {len(user_library[user_id])}",
                     MAIN_MENU
@@ -141,11 +230,9 @@ async def handle_webhook(request):
             if user_id not in user_library:
                 user_library[user_id] = []
 
-            # Главное меню
             if data_cb == "menu":
                 await edit_message(chat_id, message_id, "📦 <b>Главное меню</b>", MAIN_MENU)
 
-            # Сохранить контент
             elif data_cb == "save":
                 await edit_message(
                     chat_id,
@@ -160,7 +247,6 @@ async def handle_webhook(request):
                     BACK_BUTTON
                 )
 
-            # Библиотека
             elif data_cb == "library":
                 if not user_library[user_id]:
                     await send_message(
@@ -173,7 +259,6 @@ async def handle_webhook(request):
                     await edit_message(chat_id, message_id, "📦 <b>Главное меню</b>", MAIN_MENU)
                     return
 
-                # Показываем список
                 lib_text = "📚 <b>Твоя библиотека</b>\n\n"
                 for item in user_library[user_id]:
                     lib_text += f"• {item['type'].upper()} (ID {item['id']}) - {item['timestamp'][:10]}\n"
@@ -182,7 +267,6 @@ async def handle_webhook(request):
 
                 await edit_message(chat_id, message_id, lib_text, BACK_BUTTON)
 
-            # Публикация в канал
             elif data_cb == "publish":
                 await send_message(
                     chat_id,
@@ -192,7 +276,6 @@ async def handle_webhook(request):
                 )
                 user_states[user_id] = "waiting_channel_id"
 
-            # Назад
             elif data_cb == "back":
                 await edit_message(chat_id, message_id, "📦 <b>Главное меню</b>", MAIN_MENU)
 
