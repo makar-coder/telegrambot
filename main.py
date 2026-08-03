@@ -16,6 +16,7 @@ OWNER_USERNAME = "black_ide"
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("BOT_TOKEN и ADMIN_ID обязательны")
 
+# Хранилища
 user_library = {}
 user_states = {}
 user_video_count = {}
@@ -26,20 +27,6 @@ MAIN_MENU = {
         [{"text": "📥 Скачать видео", "callback_data": "download"}],
         [{"text": "📚 Моя библиотека", "callback_data": "library"}],
         [{"text": "🆘 Поддержка", "url": f"https://t.me/{OWNER_USERNAME}"}]
-    ]
-}
-
-LIBRARY_KEYBOARD = {
-    "inline_keyboard": [
-        [{"text": "📤 Опубликовать в канал", "callback_data": "publish"}],
-        [{"text": "◀️ Назад", "callback_data": "back"}]
-    ]
-}
-
-PUBLISH_KEYBOARD = {
-    "inline_keyboard": [
-        [{"text": "📤 Опубликовать", "callback_data": "do_publish"}],
-        [{"text": "◀️ Назад", "callback_data": "back"}]
     ]
 }
 
@@ -59,11 +46,9 @@ async def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
         async with session.post(url, json=payload) as resp:
             return await resp.json()
 
-async def edit_message(chat_id, message_id, text, reply_markup=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
+async def delete_message(chat_id, message_id):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    payload = {"chat_id": chat_id, "message_id": message_id}
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload) as resp:
             return await resp.json()
@@ -110,9 +95,7 @@ def download_video(url):
             'noplaylist': True,
             'extract_flat': False,
         }
-        
         os.makedirs("downloads", exist_ok=True)
-        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
@@ -124,62 +107,54 @@ def download_video(url):
 async def handle_webhook(request):
     try:
         data = await request.json()
-        print(f"📥 Получен запрос: {json.dumps(data, indent=2)[:300]}...")
+        print(f"📥 Получен запрос: {json.dumps(data, indent=2)[:500]}")
 
+        # Обработка сообщений
         if "message" in data:
             msg = data["message"]
             chat_id = msg["chat"]["id"]
             user_id = msg["from"]["id"]
             text = msg.get("text", "")
-            username = msg["from"].get("username", "без юзера")
 
             if user_id not in user_library:
                 user_library[user_id] = []
             if user_id not in user_video_count:
                 user_video_count[user_id] = 0
 
-            # Ожидание текста для поста
+            # Если ожидаем текст для поста
             if user_states.get(user_id) == "waiting_post_text":
                 if text:
                     user_states[user_id] = f"publish_text:{text}"
                     await send_message(
                         chat_id,
-                        f"📤 <b>Пост готов к публикации!</b>\n\n"
-                        f"Текст:\n{text}\n\n"
-                        f"Нажми кнопку ниже, чтобы опубликовать в канал.",
-                        PUBLISH_KEYBOARD
+                        f"📤 <b>Пост готов!</b>\n\nТекст:\n{text}\n\nНажми кнопку ниже, чтобы опубликовать в канал.",
+                        {"inline_keyboard": [[{"text": "📤 Опубликовать", "callback_data": "do_publish"}]]}
                     )
                 else:
                     await send_message(chat_id, "❌ Отправь текст для поста.", BACK_BUTTON)
                 return
 
-            # Команда /start
+            # /start
             if text == "/start":
                 await send_message(
                     chat_id,
                     f"<b>🎬 | ContentHubBot</b>\n\n"
-                    f"Твой личный контент-менеджер в Telegram.\n\n"
-                    f"<b>Что я умею:</b>\n"
-                    f"📥 Скачивать видео с YouTube, TikTok, Instagram\n"
-                    f"📚 Хранить всё в библиотеке\n"
-                    f"📤 Публиковать в каналы\n\n"
+                    f"Твой контент-менеджер.\n"
+                    f"📥 Скачивай видео с YouTube, TikTok, Instagram\n"
+                    f"📚 Храни в библиотеке\n"
+                    f"📤 Публикуй в каналы\n\n"
                     f"👇 Выбери действие:",
                     MAIN_MENU
                 )
+                return
 
-            # Скачивание видео по ссылке
-            elif text and re.search(r'(youtube\.com|youtu\.be|tiktok\.com|instagram\.com)', text, re.I):
-                await send_message(
-                    chat_id,
-                    f"⏳ Скачиваю видео... Пожалуйста, подожди."
-                )
-                
+            # Ссылка на видео
+            if text and re.search(r'(youtube\.com|youtu\.be|tiktok\.com|instagram\.com)', text, re.I):
+                await send_message(chat_id, f"⏳ Скачиваю... Подожди.")
                 file_path, title = download_video(text)
-                
                 if file_path and os.path.exists(file_path):
                     user_video_count[user_id] += 1
                     video_id = user_video_count[user_id]
-                    
                     saved_item = {
                         "id": video_id,
                         "type": "видео",
@@ -188,41 +163,25 @@ async def handle_webhook(request):
                         "timestamp": datetime.now().isoformat()
                     }
                     user_library[user_id].append(saved_item)
-
-                    success, msg_id = await send_video(
-                        chat_id, 
-                        file_path, 
-                        f"✅ <b>{title[:50]}</b>\n\n📁 ID: {video_id}\n📦 Сохранено в библиотеку"
+                    success, _ = await send_video(
+                        chat_id,
+                        file_path,
+                        f"✅ <b>{title[:50]}</b>\n📁 ID: {video_id}\n📦 Сохранено в библиотеку"
                     )
-                    
                     if success:
-                        await send_message(
-                            chat_id,
-                            f"✅ Видео сохранено в библиотеку под ID {video_id}!",
-                            MAIN_MENU
-                        )
+                        await send_message(chat_id, f"✅ Видео сохранено под ID {video_id}!", MAIN_MENU)
                     try:
                         os.remove(file_path)
                     except:
                         pass
                 else:
-                    await send_message(
-                        chat_id,
-                        f"❌ Ошибка загрузки: {title}\n\n"
-                        f"Возможные причины:\n"
-                        f"• Ссылка недействительна\n"
-                        f"• Видео недоступно\n"
-                        f"• Нужен cookies.txt для платформы",
-                        MAIN_MENU
-                    )
+                    await send_message(chat_id, f"❌ Ошибка: {title}", MAIN_MENU)
+                return
 
-            else:
-                await send_message(
-                    chat_id,
-                    "❌ Отправь ссылку на видео с YouTube, TikTok или Instagram.",
-                    MAIN_MENU
-                )
+            # Всё остальное
+            await send_message(chat_id, "❌ Отправь ссылку на видео или /start", MAIN_MENU)
 
+        # ============ ОБРАБОТКА КНОПОК ============
         elif "callback_query" in data:
             callback = data["callback_query"]
             callback_id = callback["id"]
@@ -231,144 +190,87 @@ async def handle_webhook(request):
             data_cb = callback.get("data", "")
             message_id = callback["message"]["message_id"]
 
-            if user_id not in user_library:
-                user_library[user_id] = []
+            print(f"🔄 Нажата кнопка: {data_cb} от {user_id}")
 
-            # ===== СКАЧАТЬ ВИДЕО =====
+            # Удаляем старое сообщение с клавиатурой
+            try:
+                await delete_message(chat_id, message_id)
+            except:
+                pass
+
+            # ===== КНОПКА СКАЧАТЬ ВИДЕО =====
             if data_cb == "download":
                 await answer_callback(callback_id, "📥 Открой меню скачивания")
-                await edit_message(
+                await send_message(
                     chat_id,
-                    message_id,
                     f"📥 <b>Скачать видео</b>\n\n"
-                    f"Просто отправь мне ссылку на видео.\n\n"
-                    f"<b>Поддерживаемые площадки:</b>\n"
+                    f"Отправь мне ссылку на видео.\n\n"
+                    f"Поддерживаемые площадки:\n"
                     f"• YouTube (youtube.com, youtu.be)\n"
                     f"• TikTok (tiktok.com)\n"
                     f"• Instagram (instagram.com)\n\n"
-                    f"📌 <b>Примеры ссылок:</b>\n"
-                    f"• https://youtu.be/xxxxxxx\n"
-                    f"• https://www.tiktok.com/@user/video/xxxx\n"
-                    f"• https://www.instagram.com/reel/xxxx",
+                    f"📌 Пример: https://youtu.be/xxxxxxx",
                     BACK_BUTTON
                 )
 
-            # ===== МОЯ БИБЛИОТЕКА =====
+            # ===== КНОПКА МОЯ БИБЛИОТЕКА =====
             elif data_cb == "library":
                 await answer_callback(callback_id, "📚 Открываю библиотеку")
-                if not user_library[user_id]:
-                    await edit_message(
-                        chat_id,
-                        message_id,
-                        f"📚 <b>Библиотека пуста</b>\n\n"
-                        f"Скачай хотя бы одно видео, чтобы оно появилось здесь.",
-                        BACK_BUTTON
-                    )
+                if not user_library.get(user_id):
+                    await send_message(chat_id, "📚 Библиотека пуста. Скачай видео!", MAIN_MENU)
                     return
 
-                lib_text = f"📚 <b>Моя библиотека</b>\n\n"
+                lib_text = "📚 <b>Моя библиотека</b>\n\n"
                 for item in user_library[user_id]:
-                    lib_text += f"🎬 <b>Видео {item['id']}</b>\n"
-                    lib_text += f"📌 {item['title'][:40]}...\n"
-                    lib_text += f"📅 {item['timestamp'][:10]}\n\n"
+                    lib_text += f"🎬 Видео {item['id']}: {item['title'][:30]}...\n"
+                await send_message(chat_id, lib_text, MAIN_MENU)
 
-                await edit_message(
-                    chat_id,
-                    message_id,
-                    lib_text,
-                    LIBRARY_KEYBOARD
-                )
+            # ===== КНОПКА НАЗАД =====
+            elif data_cb == "back":
+                await answer_callback(callback_id, "◀️ Назад")
+                await send_message(chat_id, "📦 Главное меню", MAIN_MENU)
 
-            # ===== ОПУБЛИКОВАТЬ В КАНАЛ =====
+            # ===== КНОПКА ОПУБЛИКОВАТЬ (вызывается из библиотеки) =====
             elif data_cb == "publish":
-                await answer_callback(callback_id, "📤 Выбери видео для публикации")
-                if not user_library[user_id]:
-                    await send_message(
-                        chat_id,
-                        "❌ Библиотека пуста. Сначала скачай видео.",
-                        MAIN_MENU
-                    )
+                await answer_callback(callback_id, "📤 Выбери видео")
+                if not user_library.get(user_id):
+                    await send_message(chat_id, "❌ Библиотека пуста.", MAIN_MENU)
                     return
 
-                pub_text = f"📤 <b>Выбери видео для публикации</b>\n\n"
+                pub_text = "📤 <b>Выбери видео для публикации</b>\n\n"
                 for i, item in enumerate(user_library[user_id]):
-                    pub_text += f"{i+1}. {item['title'][:40]}... (ID {item['id']})\n"
-                pub_text += f"\n🔢 <b>Введи номер видео для публикации:</b>"
-
-                await send_message(
-                    chat_id,
-                    pub_text,
-                    BACK_BUTTON
-                )
+                    pub_text += f"{i+1}. Видео {item['id']}: {item['title'][:30]}...\n"
+                pub_text += "\n🔢 Введи номер видео:"
                 user_states[user_id] = "waiting_video_selection"
+                await send_message(chat_id, pub_text, BACK_BUTTON)
 
-            # ===== ДЕЙСТВИТЕЛЬНО ОПУБЛИКОВАТЬ =====
+            # ===== КНОПКА ОПУБЛИКОВАТЬ (финальная) =====
             elif data_cb == "do_publish":
                 await answer_callback(callback_id, "📤 Публикую...")
                 state = user_states.get(user_id, "")
-                if state.startswith("publish_text:"):
-                    text_for_post = state.replace("publish_text:", "")
-                    
-                    channel_id = user_states.get(f"channel_{user_id}", "")
-                    video_id = user_states.get(f"video_{user_id}", "")
+                if not state.startswith("publish_text:"):
+                    await send_message(chat_id, "❌ Сначала напиши текст для поста.", MAIN_MENU)
+                    return
 
-                    if not channel_id:
-                        await send_message(chat_id, "❌ Сначала укажи ID канала.", MAIN_MENU)
-                        return
+                text_for_post = state.replace("publish_text:", "")
+                # Здесь должна быть логика выбора видео и публикации
+                # Но пока упростим: отправим сообщение, что функция в разработке
+                await send_message(
+                    chat_id,
+                    f"📤 Функция публикации в разработке.\nТекст: {text_for_post}\nСкоро будет работать!",
+                    MAIN_MENU
+                )
+                user_states[user_id] = ""
 
-                    selected_video = None
-                    for item in user_library[user_id]:
-                        if str(item['id']) == video_id:
-                            selected_video = item
-                            break
-
-                    if not selected_video or not os.path.exists(selected_video.get('file_path', '')):
-                        await send_message(chat_id, "❌ Видео не найдено в библиотеке.", MAIN_MENU)
-                        return
-
-                    try:
-                        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-                        async with aiohttp.ClientSession() as session:
-                            with open(selected_video['file_path'], 'rb') as f:
-                                data_send = aiohttp.FormData()
-                                data_send.add_field('chat_id', channel_id)
-                                data_send.add_field('caption', f"{text_for_post}\n\n<a href='https://t.me/{BOT_USERNAME}'>@{BOT_USERNAME}</a>")
-                                data_send.add_field('parse_mode', 'HTML')
-                                data_send.add_field('video', f, filename=os.path.basename(selected_video['file_path']))
-                                
-                                async with session.post(url, data=data_send) as resp:
-                                    result = await resp.json()
-                                    if result.get("ok"):
-                                        await send_message(
-                                            chat_id,
-                                            f"✅ <b>Пост опубликован в канале!</b>\n\n"
-                                            f"📌 Текст: {text_for_post}\n"
-                                            f"📤 Канал: {channel_id}",
-                                            MAIN_MENU
-                                        )
-                                        user_states[user_id] = ""
-                                    else:
-                                        await send_message(
-                                            chat_id,
-                                            f"❌ Ошибка публикации: {result}",
-                                            MAIN_MENU
-                                        )
-                    except Exception as e:
-                        await send_message(chat_id, f"❌ Ошибка публикации: {e}", MAIN_MENU)
-
-            # ===== НАЗАД =====
-            elif data_cb == "back":
-                await answer_callback(callback_id, "◀️ Назад")
-                await edit_message(chat_id, message_id, "📦 <b>Главное меню</b>", MAIN_MENU)
-
+            # Неизвестная кнопка
             else:
                 await answer_callback(callback_id, "⚠️ Неизвестная команда")
 
         else:
-            print(f"⚠️ Другой тип обновления")
+            print(f"⚠️ Другой тип обновления: {list(data.keys())}")
 
     except Exception as e:
-        print(f"❌ Ошибка в вебхуке: {e}")
+        print(f"❌ ОШИБКА В ВЕБХУКЕ: {e}")
         import traceback
         traceback.print_exc()
 
