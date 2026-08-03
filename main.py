@@ -18,26 +18,39 @@ async def send_message(chat_id, text):
             return await resp.json()
 
 async def handle_webhook(request):
-    """Обработчик вебхука"""
-    data = await request.json()
-    
-    # Проверяем, что это сообщение
-    if "message" in data:
-        message = data["message"]
-        chat_id = message["chat"]["id"]
-        user = message.get("from", {})
-        text = message.get("text", "❌ Нет текста")
-        username = user.get("username", "без юзера")
-        full_name = user.get("first_name", "") + " " + user.get("last_name", "")
+    """Обработчик вебхука с логированием"""
+    try:
+        data = await request.json()
+        print(f"📥 Получен запрос: {json.dumps(data, indent=2)}")
         
-        # Отправляем админу
-        await send_message(
-            ADMIN_ID,
-            f"📩 От: {full_name} (@{username})\n\n{text}"
-        )
-        
-        # Отвечаем пользователю
-        await send_message(chat_id, "✅ Сообщение получено и передано админу.")
+        # Проверяем, что это сообщение
+        if "message" in data:
+            message = data["message"]
+            chat_id = message["chat"]["id"]
+            user = message.get("from", {})
+            text = message.get("text", "❌ Нет текста")
+            username = user.get("username", "без юзера")
+            full_name = user.get("first_name", "") + " " + user.get("last_name", "")
+            
+            print(f"📩 Сообщение от {full_name} (@{username}): {text}")
+            
+            # Отправляем копию админу
+            await send_message(
+                ADMIN_ID,
+                f"📩 От: {full_name} (@{username})\n\n{text}"
+            )
+            
+            # Отвечаем пользователю
+            await send_message(chat_id, "✅ Сообщение получено и передано админу.")
+            
+        elif "callback_query" in data:
+            print(f"🔄 Callback: {data['callback_query']}")
+            
+        else:
+            print(f"⚠️ Другой тип обновления: {list(data.keys())}")
+            
+    except Exception as e:
+        print(f"❌ Ошибка в handle_webhook: {e}")
     
     return web.Response(text="OK")
 
@@ -45,7 +58,9 @@ async def on_startup():
     """Установка вебхука"""
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if WEBHOOK_URL:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={WEBHOOK_URL}"
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={WEBHOOK_URL}&drop_pending_updates=true"
+        print(f"🔗 Устанавливаю вебхук: {url}")
+        
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 result = await resp.json()
@@ -53,10 +68,17 @@ async def on_startup():
                     print(f"✅ Вебхук установлен: {WEBHOOK_URL}")
                 else:
                     print(f"❌ Ошибка установки вебхука: {result}")
+    else:
+        print("⚠️ WEBHOOK_URL не задан!")
+
+async def health_check(request):
+    """Проверка здоровья"""
+    return web.Response(text="I'm alive ✅")
 
 app = web.Application()
 app.router.add_post("/webhook", handle_webhook)
-app.router.add_get("/", lambda request: web.Response(text="I'm alive"))
+app.router.add_get("/", health_check)
+app.router.add_get("/health", health_check)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
@@ -67,4 +89,5 @@ if __name__ == "__main__":
     loop.run_until_complete(on_startup())
     
     print(f"🚀 Запуск на порту {port}...")
+    print(f"🔗 Вебхук ожидает запросы на /webhook")
     web.run_app(app, host="0.0.0.0", port=port)
