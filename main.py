@@ -16,7 +16,6 @@ OWNER_USERNAME = "black_ide"
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("BOT_TOKEN и ADMIN_ID обязательны")
 
-# Хранилище
 user_library = {}
 user_states = {}
 user_video_count = {}
@@ -69,6 +68,13 @@ async def edit_message(chat_id, message_id, text, reply_markup=None):
         async with session.post(url, json=payload) as resp:
             return await resp.json()
 
+async def answer_callback(callback_id, text="", show_alert=False):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_id, "text": text, "show_alert": show_alert}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            return await resp.json()
+
 async def send_video(chat_id, file_path, caption="", reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
     try:
@@ -94,30 +100,6 @@ async def send_video(chat_id, file_path, caption="", reply_markup=None):
         print(f"Ошибка отправки видео: {e}")
         return False, None
 
-async def forward_to_channel(chat_id, message_id, channel_id):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/copyMessage"
-    payload = {
-        "chat_id": channel_id,
-        "from_chat_id": chat_id,
-        "message_id": message_id
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as resp:
-            return await resp.json()
-
-async def send_to_channel_with_text(chat_id, channel_id, text, message_id):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/copyMessage"
-    payload = {
-        "chat_id": channel_id,
-        "from_chat_id": chat_id,
-        "message_id": message_id,
-        "caption": text,
-        "parse_mode": "HTML"
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as resp:
-            return await resp.json()
-
 def download_video(url):
     try:
         ydl_opts = {
@@ -142,7 +124,7 @@ def download_video(url):
 async def handle_webhook(request):
     try:
         data = await request.json()
-        print(f"📥 Получен запрос")
+        print(f"📥 Получен запрос: {json.dumps(data, indent=2)[:300]}...")
 
         if "message" in data:
             msg = data["message"]
@@ -156,7 +138,7 @@ async def handle_webhook(request):
             if user_id not in user_video_count:
                 user_video_count[user_id] = 0
 
-            # Обработка состояния (ожидание текста для поста)
+            # Ожидание текста для поста
             if user_states.get(user_id) == "waiting_post_text":
                 if text:
                     user_states[user_id] = f"publish_text:{text}"
@@ -175,7 +157,7 @@ async def handle_webhook(request):
             if text == "/start":
                 await send_message(
                     chat_id,
-                    f"<b>📦 ContentHubBot</b>\n\n"
+                    f"<b>🎬 | ContentHubBot</b>\n\n"
                     f"Твой личный контент-менеджер в Telegram.\n\n"
                     f"<b>Что я умею:</b>\n"
                     f"📥 Скачивать видео с YouTube, TikTok, Instagram\n"
@@ -198,7 +180,6 @@ async def handle_webhook(request):
                     user_video_count[user_id] += 1
                     video_id = user_video_count[user_id]
                     
-                    # Сохраняем в библиотеку
                     saved_item = {
                         "id": video_id,
                         "type": "видео",
@@ -255,6 +236,7 @@ async def handle_webhook(request):
 
             # ===== СКАЧАТЬ ВИДЕО =====
             if data_cb == "download":
+                await answer_callback(callback_id, "📥 Открой меню скачивания")
                 await edit_message(
                     chat_id,
                     message_id,
@@ -273,6 +255,7 @@ async def handle_webhook(request):
 
             # ===== МОЯ БИБЛИОТЕКА =====
             elif data_cb == "library":
+                await answer_callback(callback_id, "📚 Открываю библиотеку")
                 if not user_library[user_id]:
                     await edit_message(
                         chat_id,
@@ -298,6 +281,7 @@ async def handle_webhook(request):
 
             # ===== ОПУБЛИКОВАТЬ В КАНАЛ =====
             elif data_cb == "publish":
+                await answer_callback(callback_id, "📤 Выбери видео для публикации")
                 if not user_library[user_id]:
                     await send_message(
                         chat_id,
@@ -306,7 +290,6 @@ async def handle_webhook(request):
                     )
                     return
 
-                # Показываем список видео для выбора
                 pub_text = f"📤 <b>Выбери видео для публикации</b>\n\n"
                 for i, item in enumerate(user_library[user_id]):
                     pub_text += f"{i+1}. {item['title'][:40]}... (ID {item['id']})\n"
@@ -321,12 +304,11 @@ async def handle_webhook(request):
 
             # ===== ДЕЙСТВИТЕЛЬНО ОПУБЛИКОВАТЬ =====
             elif data_cb == "do_publish":
-                # Проверяем, есть ли текст для поста
+                await answer_callback(callback_id, "📤 Публикую...")
                 state = user_states.get(user_id, "")
                 if state.startswith("publish_text:"):
                     text_for_post = state.replace("publish_text:", "")
                     
-                    # Ищем последнее выбранное видео
                     channel_id = user_states.get(f"channel_{user_id}", "")
                     video_id = user_states.get(f"video_{user_id}", "")
 
@@ -334,7 +316,6 @@ async def handle_webhook(request):
                         await send_message(chat_id, "❌ Сначала укажи ID канала.", MAIN_MENU)
                         return
 
-                    # Ищем видео в библиотеке
                     selected_video = None
                     for item in user_library[user_id]:
                         if str(item['id']) == video_id:
@@ -345,9 +326,7 @@ async def handle_webhook(request):
                         await send_message(chat_id, "❌ Видео не найдено в библиотеке.", MAIN_MENU)
                         return
 
-                    # Отправляем в канал
                     try:
-                        # Сначала отправляем видео в канал
                         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
                         async with aiohttp.ClientSession() as session:
                             with open(selected_video['file_path'], 'rb') as f:
@@ -379,13 +358,19 @@ async def handle_webhook(request):
 
             # ===== НАЗАД =====
             elif data_cb == "back":
+                await answer_callback(callback_id, "◀️ Назад")
                 await edit_message(chat_id, message_id, "📦 <b>Главное меню</b>", MAIN_MENU)
+
+            else:
+                await answer_callback(callback_id, "⚠️ Неизвестная команда")
 
         else:
             print(f"⚠️ Другой тип обновления")
 
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        print(f"❌ Ошибка в вебхуке: {e}")
+        import traceback
+        traceback.print_exc()
 
     return web.Response(text="OK")
 
