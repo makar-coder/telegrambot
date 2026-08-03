@@ -18,32 +18,16 @@ dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def start_handler(message: Message):
-    await message.answer("✅ Бот-ретранслятор работает. Все сообщения передаются админу.")
+    await message.answer("✅ Бот работает!")
 
 @dp.message()
 async def relay_handler(message: Message):
-    user = message.from_user
-    text = message.text or "❌ Нет текста"
-
-    # 1. Отправляем копию админу
-    await bot.send_message(
-        ADMIN_ID,
-        f"📩 От: {user.full_name} (@{user.username or 'без юзера'})\n\n{text}"
-    )
-
-    # 2. Отвечаем отправителю (шаблон)
-    await message.answer("✅ Сообщение получено и передано админу.")
-
-async def on_startup():
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    if WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-        print(f"✅ Вебхук установлен: {WEBHOOK_URL}")
+    await message.answer(f"📩 {message.text}")
 
 def main():
     app = web.Application()
     app.router.post("/webhook", dp._webhook_handler)
-    app.router.get("/", lambda request: web.Response(text="✅ Бот работает!"))
+    app.router.get("/", lambda request: web.Response(text="✅ OK"))
     
     port = int(os.environ.get("PORT", 8080))
     print(f"🚀 Запуск на порту {port}...")
