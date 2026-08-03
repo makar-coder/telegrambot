@@ -1,0 +1,12 @@
+{
+  "builds": [
+    {
+      "src": ".",
+      "use": "python"
+    }
+  ],
+  "deploy": {
+    "startCommand": "python main.py",
+    "healthcheckPath": "/"
+  }
+}
