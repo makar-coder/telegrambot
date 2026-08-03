@@ -1,12 +1,11 @@
 import os
-import asyncio
 import re
 import json
-import time
+import asyncio
+import yt_dlp
 from datetime import datetime
 from aiohttp import web
 import aiohttp
-import yt_dlp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
@@ -17,7 +16,6 @@ if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("BOT_TOKEN и ADMIN_ID обязательны")
 
 user_library = {}
-user_states = {}
 user_video_count = {}
 
 # ============ КЛАВИАТУРЫ ============
@@ -36,9 +34,9 @@ BACK_BUTTON = {
 }
 
 # ============ ФУНКЦИИ ============
-async def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
+async def send_message(chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     async with aiohttp.ClientSession() as session:
@@ -47,19 +45,34 @@ async def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
 
 async def edit_message(chat_id, message_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload) as resp:
             return await resp.json()
 
-async def answer_callback(callback_id, text="", show_alert=False):
+async def answer_callback(callback_id):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
-    payload = {"callback_query_id": callback_id, "text": text, "show_alert": show_alert}
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as resp:
+        async with session.post(url, json={"callback_query_id": callback_id}) as resp:
             return await resp.json()
+
+async def send_video(chat_id, file_path, caption=""):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+    try:
+        async with aiohttp.ClientSession() as session:
+            with open(file_path, 'rb') as f:
+                data = aiohttp.FormData()
+                data.add_field('chat_id', str(chat_id))
+                data.add_field('caption', caption)
+                data.add_field('video', f, filename=os.path.basename(file_path))
+                async with session.post(url, data=data) as resp:
+                    result = await resp.json()
+                    return result.get("ok", False)
+    except Exception as e:
+        print(f"❌ Ошибка отправки видео: {e}")
+        return False
 
 def download_video(url):
     try:
@@ -69,44 +82,20 @@ def download_video(url):
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
-            'extract_flat': False,
         }
         os.makedirs("downloads", exist_ok=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            return filename, info.get('title', 'Video')
+            return ydl.prepare_filename(info), info.get('title', 'Video')
     except Exception as e:
         return None, str(e)
-
-async def send_video(chat_id, file_path, caption="", reply_markup=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-    try:
-        async with aiohttp.ClientSession() as session:
-            with open(file_path, 'rb') as f:
-                data = aiohttp.FormData()
-                data.add_field('chat_id', str(chat_id))
-                data.add_field('caption', caption)
-                data.add_field('video', f, filename=os.path.basename(file_path))
-                if reply_markup:
-                    data.add_field('reply_markup', json.dumps(reply_markup))
-                async with session.post(url, data=data) as resp:
-                    result = await resp.json()
-                    if result.get("ok"):
-                        return True
-                    else:
-                        return False
-    except Exception as e:
-        print(f"Ошибка отправки видео: {e}")
-        return False
 
 # ============ ВЕБХУК ============
 async def handle_webhook(request):
     try:
         data = await request.json()
-        print(f"📥 Получен запрос: {json.dumps(data, indent=2)[:500]}")
+        print(f"📥 {json.dumps(data, indent=2)[:300]}")
 
-        # Обработка сообщений
         if "message" in data:
             msg = data["message"]
             chat_id = msg["chat"]["id"]
@@ -121,30 +110,23 @@ async def handle_webhook(request):
             if text == "/start":
                 await send_message(
                     chat_id,
-                    f"<b>🎬 | ContentHubBot</b>\n\n"
-                    f"Твой контент-менеджер.\n"
-                    f"📥 Скачивай видео с YouTube, TikTok, Instagram\n"
-                    f"📚 Храни в библиотеке\n"
-                    f"📤 Публикуй в каналы\n\n"
-                    f"👇 Выбери действие:",
+                    "<b>🎬 | ContentHubBot</b>\n\nТвой контент-менеджер.\n📥 Скачивай видео с YouTube, TikTok, Instagram\n📚 Храни в библиотеке\n\n👇 Выбери действие:",
                     MAIN_MENU
                 )
                 return
 
-            if text and re.search(r'(youtube\.com|youtu\.be|tiktok\.com|instagram\.com)', text, re.I):
-                await send_message(chat_id, f"⏳ Скачиваю... Подожди.")
+            if re.search(r'(youtube\.com|youtu\.be|tiktok\.com|instagram\.com)', text, re.I):
+                await send_message(chat_id, "⏳ Скачиваю... Подожди.")
                 file_path, title = download_video(text)
                 if file_path and os.path.exists(file_path):
                     user_video_count[user_id] += 1
                     video_id = user_video_count[user_id]
-                    saved_item = {
+                    user_library[user_id].append({
                         "id": video_id,
-                        "type": "видео",
                         "title": title[:50],
                         "file_path": file_path,
                         "timestamp": datetime.now().isoformat()
-                    }
-                    user_library[user_id].append(saved_item)
+                    })
                     success = await send_video(
                         chat_id,
                         file_path,
@@ -162,29 +144,22 @@ async def handle_webhook(request):
 
             await send_message(chat_id, "❌ Отправь ссылку на видео или /start", MAIN_MENU)
 
-        # ============ ОБРАБОТКА КНОПОК ============
         elif "callback_query" in data:
-            callback = data["callback_query"]
-            callback_id = callback["id"]
-            chat_id = callback["message"]["chat"]["id"]
-            user_id = callback["from"]["id"]
-            data_cb = callback.get("data", "")
-            message_id = callback["message"]["message_id"]
+            cb = data["callback_query"]
+            cb_id = cb["id"]
+            chat_id = cb["message"]["chat"]["id"]
+            user_id = cb["from"]["id"]
+            data_cb = cb.get("data", "")
+            message_id = cb["message"]["message_id"]
 
-            print(f"🔄 Нажата кнопка: {data_cb} от {user_id}")
-            await answer_callback(callback_id)
+            print(f"🔄 Нажата кнопка: {data_cb}")
+            await answer_callback(cb_id)
 
             if data_cb == "download":
                 await edit_message(
                     chat_id,
                     message_id,
-                    f"📥 <b>Скачать видео</b>\n\n"
-                    f"Отправь мне ссылку на видео.\n\n"
-                    f"Поддерживаемые площадки:\n"
-                    f"• YouTube (youtube.com, youtu.be)\n"
-                    f"• TikTok (tiktok.com)\n"
-                    f"• Instagram (instagram.com)\n\n"
-                    f"📌 Пример: https://youtu.be/xxxxxxx",
+                    "📥 <b>Скачать видео</b>\n\nОтправь мне ссылку на видео.\n\nПоддерживаемые площадки:\n• YouTube\n• TikTok\n• Instagram",
                     BACK_BUTTON
                 )
 
@@ -192,7 +167,6 @@ async def handle_webhook(request):
                 if not user_library.get(user_id):
                     await edit_message(chat_id, message_id, "📚 Библиотека пуста. Скачай видео!", MAIN_MENU)
                     return
-
                 lib_text = "📚 <b>Моя библиотека</b>\n\n"
                 for item in user_library[user_id]:
                     lib_text += f"🎬 Видео {item['id']}: {item['title'][:30]}...\n"
@@ -205,7 +179,7 @@ async def handle_webhook(request):
                 await edit_message(chat_id, message_id, "⚠️ Неизвестная команда", MAIN_MENU)
 
     except Exception as e:
-        print(f"❌ ОШИБКА: {e}")
+        print(f"❌ Ошибка: {e}")
         import traceback
         traceback.print_exc()
 
@@ -222,7 +196,7 @@ async def on_startup():
                 if result.get("ok"):
                     print(f"✅ Вебхук установлен: {WEBHOOK_URL}")
                 else:
-                    print(f"❌ Ошибка: {result}")
+                    print(f"❌ Ошибка установки вебхука: {result}")
 
 app = web.Application()
 app.router.add_post("/webhook", handle_webhook)
