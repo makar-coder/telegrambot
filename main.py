@@ -1,4 +1,5 @@
 import os
+import asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import Command
@@ -35,6 +36,29 @@ async def handle_webhook(request):
     update = await request.json()
     await dp.process_update(update)
     return web.Response(text="OK")
+
+async def on_startup():
+    """Установка вебхука при запуске"""
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        print(f"✅ Вебхук установлен: {WEBHOOK_URL}")
+
+def main():
+    app = web.Application()
+    app.router.add_route("POST", "/webhook", handle_webhook)
+    app.router.add_route("GET", "/", lambda request: web.Response(text="✅ OK"))
+
+    port = int(os.environ.get("PORT", 8080))
+    print(f"🚀 Запуск на порту {port}...")
+    
+    # Запускаем установку вебхука
+    asyncio.run(on_startup())
+
+    web.run_app(app, host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    main()    return web.Response(text="OK")
 
 def main():
     app = web.Application()
