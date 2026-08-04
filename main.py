@@ -251,57 +251,105 @@ async def download_track(url: str) -> Optional[str]:
         return None
     return await loop.run_in_executor(None, _dl)
 
-async def get_lyrics(title: str, artist: str) -> Optional[str]:
-    """Try multiple sources: Genius API -> Genius scrape -> lyrics.ovh"""
-    query = f"{artist} {title}".strip()
+def _clean_lyrics(raw: str) -> str:
+    raw = re.sub(r'<br\s*/?>', '\n', raw, flags=re.IGNORECASE)
+    raw = re.sub(r'<[^>]+>', '', raw)
+    raw = html.unescape(raw)
+    raw = raw.replace('\r\n', '\n').replace('\r', '\n')
+    raw = re.sub(r'\n{3,}', '\n\n', raw)
+    return raw.strip()
 
-    # Source 1: lyrics.ovh (free, no token needed)
+async def get_lyrics(title: str, artist: str) -> Optional[str]:
+    clean_title = re.sub(r'[\(\[].*?[\)\]]', '', title).strip()
+    clean_artist = re.sub(r'[\(\[].*?[\)\]]', '', artist).strip()
+    query = f"{clean_artist} {clean_title}".strip()
+    headers_browser = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    }
+
+    async def scrape_genius_url(session, url):
+        async with session.get(url, headers=headers_browser) as r2:
+            page = await r2.text()
+        containers = re.findall(r'<div[^>]*data-lyrics-container="true"[^>]*>(.*?)</div>\s*</div>', page, re.DOTALL)
+        if not containers:
+            containers = re.findall(r'<div[^>]*data-lyrics-container[^>]*>(.*?)</div>', page, re.DOTALL)
+        if containers:
+            lyr = _clean_lyrics("\n".join(containers))
+            if lyr and len(lyr) > 80:
+                return lyr[:4096]
+        return None
+
+    # Source 1: lyrics.ovh
     try:
         async with ClientSession(timeout=ClientTimeout(total=8)) as session:
-            safe_artist = artist.replace("/", " ")
-            safe_title = title.replace("/", " ")
-            url = f"https://api.lyrics.ovh/v1/{safe_artist}/{safe_title}"
-            async with session.get(url) as r:
+            sa = clean_artist.replace("/", " ")
+            st = clean_title.replace("/", " ")
+            async with session.get(f"https://api.lyrics.ovh/v1/{sa}/{st}") as r:
                 if r.status == 200:
-                    data = await r.json()
-                    lyrics = data.get("lyrics", "").strip()
-                    if lyrics and len(lyrics) > 50:
-                        return lyrics[:4096]
+                    data = await r.json(content_type=None)
+                    lyr = data.get("lyrics", "").strip()
+                    if lyr and len(lyr) > 80:
+                        return lyr[:4096]
     except Exception:
         pass
 
-    # Source 2: Genius API + scrape
+    # Source 2: Genius multi-search scrape
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=12)) as session:
+            import urllib.parse
+            search_url = f"https://genius.com/api/search/multi?per_page=5&q={urllib.parse.quote(query)}"
+            async with session.get(search_url, headers=headers_browser) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    song_url = None
+                    for section in data.get("response", {}).get("sections", []):
+                        for h in section.get("hits", []):
+                            if h.get("type") == "song":
+                                song_url = h["result"].get("url")
+                                break
+                        if song_url:
+                            break
+                    if song_url:
+                        lyr = await scrape_genius_url(session, song_url)
+                        if lyr:
+                            return lyr
+    except Exception:
+        pass
+
+    # Source 3: Genius API + scrape
     if GENIUS_TOKEN:
         try:
             async with ClientSession(timeout=ClientTimeout(total=10)) as session:
-                params = {"q": query}
-                headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
-                async with session.get("https://api.genius.com/search",
-                                       params=params, headers=headers) as r:
-                    data = await r.json()
+                api_headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
+                async with session.get("https://api.genius.com/search", params={"q": query}, headers=api_headers) as r:
+                    data = await r.json(content_type=None)
                 hits = data.get("response", {}).get("hits", [])
                 if hits:
-                    song_url = hits[0]["result"]["url"]
-                    headers2 = {"User-Agent": "Mozilla/5.0 (compatible)"}
-                    async with session.get(song_url, headers=headers2) as r:
-                        text = await r.text()
-                    # extract all lyrics containers
-                    matches = re.findall(
-                        r'<div[^>]*data-lyrics-container[^>]*>(.*?)</div>',
-                        text, re.DOTALL
-                    )
-                    if matches:
-                        raw = ''.join(matches)
-                        raw = re.sub(r'<br\s*/?>', '\n', raw, flags=re.IGNORECASE)
-                        raw = re.sub(r'<[^>]+>', '', raw)
-                        lyrics = html.unescape(raw).strip()
-                        lyrics = re.sub(r'\n{3,}', '\n\n', lyrics)
-                        if lyrics and len(lyrics) > 50:
-                            return lyrics[:4096]
+                    lyr = await scrape_genius_url(session, hits[0]["result"]["url"])
+                    if lyr:
+                        return lyr
         except Exception:
             pass
 
+    # Source 4: azlyrics
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=10)) as session:
+            a = re.sub(r"[^a-z0-9]", "", clean_artist.lower())
+            t = re.sub(r"[^a-z0-9]", "", clean_title.lower())
+            async with session.get(f"https://www.azlyrics.com/lyrics/{a}/{t}.html", headers=headers_browser) as r:
+                if r.status == 200:
+                    page = await r.text()
+                    m = re.search(r'<!-- Usage[^>]*-->\s*(.*?)\s*<!-- MxM[^>]*-->', page, re.DOTALL)
+                    if m:
+                        lyr = _clean_lyrics(m.group(1))
+                        if lyr and len(lyr) > 80:
+                            return lyr[:4096]
+    except Exception:
+        pass
+
     return None
+
 
 # ─── FSM STATES ──────────────────────────────────────────────────────────────
 
@@ -882,24 +930,32 @@ async def inline_search(inline: InlineQuery):
         return
     service = get_user_service(inline.from_user.id)
     tracks = await search_tracks(query, service)
+    if not tracks:
+        await inline.answer([], cache_time=30)
+        return
+    bot_info = await inline.bot.get_me()
+    bot_username = bot_info.username
     results = []
     for i, t in enumerate(tracks[:20]):
         token = store_url(t["url"])
         _url_cache[token] = t["url"]
         _meta_cache[token] = {"title": t["title"], "artist": t["uploader"]}
-        duration = t.get("duration", 0)
-        thumb = t.get("thumb", "")
         results.append(
-            InlineQueryResultAudio(
+            InlineQueryResultArticle(
                 id=str(i),
-                audio_url=t["url"] if t["url"].startswith("http") else f"https://soundcloud.com",
-                title=t["title"][:64],
-                performer=t["uploader"][:64],
-                audio_duration=duration,
-                caption=f"🎵 <b>{html.escape(t['title'])}</b>\n👤 {html.escape(t['uploader'])}\n\nНайдено ботом @{(await inline.bot.get_me()).username}",
-                parse_mode="HTML",
+                title=f"🎵 {t['title'][:60]}",
+                description=f"👤 {t['uploader']}",
+                input_message_content=InputTextMessageContent(
+                    message_text=f"🎵 <b>{html.escape(t['title'])}</b>\n"
+                                 f"👤 {html.escape(t['uploader'])}\n\n"
+                                 f"⬇️ Нажми кнопку ниже чтобы получить трек в ЛС",
+                    parse_mode="HTML"
+                ),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="⬇️ Скачать в ЛС", url=f"https://t.me/{(await inline.bot.get_me()).username}?start=dl_{token}")
+                    InlineKeyboardButton(
+                        text="⬇️ Скачать трек",
+                        url=f"https://t.me/{bot_username}?start=dl_{token}"
+                    )
                 ]])
             )
         )
