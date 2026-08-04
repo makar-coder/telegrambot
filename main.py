@@ -40,6 +40,9 @@ logging.basicConfig(level=logging.INFO, filename="bot.log", filemode="a",
                     format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# in-memory url cache (token -> full url)
+_url_cache: Dict[str, str] = {}
+
 # ─── DATABASE ────────────────────────────────────────────────────────────────
 
 def init_db():
@@ -404,58 +407,66 @@ async def handle_search(msg: Message, state: FSMContext):
 
 # ─── DOWNLOAD ────────────────────────────────────────────────────────────────
 
-# Хранилище url по токену (в памяти, достаточно для сессии)
-_url_cache: Dict[str, str] = {}
-
-@router.callback_query(F.data == "search_start")
-async def cb_search_again(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(SearchState.waiting_query)
-    await cb.message.edit_text("🔍 Введи название песни или исполнителя:")
-
 @router.callback_query(F.data.startswith("dl:"))
 async def cb_download(cb: CallbackQuery):
     token = cb.data[3:]
-    # ищем полный url по короткому токену
-    full_token = next((k for k in _url_cache if k.startswith(token)), None)
-    if not full_token:
+    url = _url_cache.get(token)
+    if not url:
+        # попробуем найти по префиксу
+        url = next((v for k, v in _url_cache.items() if k.startswith(token) or token.startswith(k)), None)
+    if not url:
         await cb.answer("⚠️ Трек устарел, сделай новый поиск", show_alert=True)
         return
-    url = _url_cache[full_token]
+
     await cb.answer("⏳ Скачиваю...")
-    wait = await cb.message.answer("⏬ Загружаю трек, подожди...")
+    wait = await cb.message.answer("⏬ Загружаю трек, это займёт 10-30 сек...")
+
+    print(f"DOWNLOADING: {url}", flush=True)
     path = await download_track(url)
+    print(f"DOWNLOAD RESULT: {path}", flush=True)
+
     if not path or not os.path.exists(path):
-        await wait.edit_text("❌ Не удалось загрузить трек.")
+        await wait.edit_text("❌ Не удалось загрузить трек. Попробуй другой.")
         return
 
-    # получаем мета через yt-dlp
-    def get_meta():
-        with YoutubeDL({"quiet": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info.get("title", "Unknown"), info.get("uploader", "Unknown"), info.get("thumbnail", "")
-    
     loop = asyncio.get_event_loop()
+    def get_meta():
+        try:
+            with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return (
+                    info.get("title", "Unknown"),
+                    info.get("uploader") or info.get("channel") or "Unknown",
+                    info.get("thumbnail", "")
+                )
+        except Exception:
+            return "Unknown", "Unknown", ""
+
     title, artist, thumb = await loop.run_in_executor(None, get_meta)
 
     with db() as conn:
         conn.execute("UPDATE stats SET value=value+1 WHERE key='total_downloads'")
         conn.commit()
 
-    short_token = full_token[:60]
     audio = FSInputFile(path, filename=f"{title}.mp3")
-    await cb.message.answer_audio(
-        audio,
-        title=title,
-        performer=artist,
-        caption=f"🎵 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}",
-        parse_mode="HTML",
-        reply_markup=track_kb(short_token, title, artist, short_token)
-    )
-    await wait.delete()
     try:
-        os.remove(path)
-    except Exception:
-        pass
+        await cb.message.answer_audio(
+            audio,
+            title=title[:64],
+            performer=artist[:64],
+            caption=f"🎵 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}",
+            parse_mode="HTML",
+            reply_markup=track_kb(token, title, artist, token)
+        )
+        await wait.delete()
+    except Exception as e:
+        print(f"SEND ERROR: {e}", flush=True)
+        await wait.edit_text(f"❌ Ошибка отправки: {e}")
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 # ─── LYRICS ──────────────────────────────────────────────────────────────────
 
