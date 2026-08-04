@@ -134,11 +134,30 @@ def get_all_searches_txt() -> str:
 
 # ─── YT-DLP SEARCH & DOWNLOAD ────────────────────────────────────────────────
 
+_id_counter = 0
+_id_to_url: Dict[int, str] = {}
+_url_to_id: Dict[str, int] = {}
+
+def store_url(url: str) -> str:
+    global _id_counter
+    if url in _url_to_id:
+        return str(_url_to_id[url])
+    _id_counter += 1
+    _id_to_url[_id_counter] = url
+    _url_to_id[url] = _id_counter
+    return str(_id_counter)
+
+def get_url(token: str) -> str:
+    try:
+        return _id_to_url.get(int(token), "")
+    except Exception:
+        return ""
+
 def encode_url(url: str) -> str:
-    return base64.urlsafe_b64encode(url.encode()).decode()
+    return store_url(url)
 
 def decode_url(token: str) -> str:
-    return base64.urlsafe_b64decode(token.encode()).decode()
+    return get_url(token)
 
 # user service preference
 _user_service: Dict[int, str] = {}
@@ -298,19 +317,21 @@ def service_kb(user_id: int) -> InlineKeyboardMarkup:
 def search_results_kb(tracks: List[Dict]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for i, t in enumerate(tracks):
-        token = encode_url(t["url"])
+        token = store_url(t["url"])
+        _url_cache[token] = t["url"]
+        _meta_cache[token] = {"title": t["title"], "artist": t["uploader"]}
         label = f"🎵 {t['title'][:40]}"
-        kb.button(text=label, callback_data=f"dl:{token[:60]}")
+        kb.button(text=label, callback_data=f"dl:{token}")
     kb.button(text="🏠 Главное меню", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
 
 def track_kb(token: str, title: str, artist: str, playlist_token: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    # store title/artist in cache keyed by token for lyrics/playlist use
     _meta_cache[token] = {"title": title, "artist": artist}
-    kb.button(text="📝 Показать текст", callback_data=f"lyrics:{token}")
-    kb.button(text="➕ В плейлист", callback_data=f"addpl:{token}")
+    # token is short int string e.g. "1", "2" — never exceeds 64 bytes
+    kb.button(text="📝 Показать текст", callback_data=f"lyr:{token}")
+    kb.button(text="➕ В плейлист", callback_data=f"apl:{token}")
     kb.button(text="🏠 Главное меню", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -413,10 +434,7 @@ async def handle_search(msg: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("dl:"))
 async def cb_download(cb: CallbackQuery):
     token = cb.data[3:]
-    url = _url_cache.get(token)
-    if not url:
-        # попробуем найти по префиксу
-        url = next((v for k, v in _url_cache.items() if k.startswith(token) or token.startswith(k)), None)
+    url = get_url(token) or _url_cache.get(token)
     if not url:
         await cb.answer("⚠️ Трек устарел, сделай новый поиск", show_alert=True)
         return
@@ -473,9 +491,9 @@ async def cb_download(cb: CallbackQuery):
 
 # ─── LYRICS ──────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("lyrics:"))
+@router.callback_query(F.data.startswith("lyr:"))
 async def cb_lyrics(cb: CallbackQuery):
-    token = cb.data[7:]
+    token = cb.data[4:]
     meta = _meta_cache.get(token, {})
     title = meta.get("title", "Unknown")
     artist = meta.get("artist", "Unknown")
@@ -537,9 +555,9 @@ async def cb_pl_delete(cb: CallbackQuery):
         conn.commit()
     await cb.message.edit_text("🗑 Плейлист удалён.", reply_markup=playlists_kb(cb.from_user.id))
 
-@router.callback_query(F.data.startswith("addpl:"))
+@router.callback_query(F.data.startswith("apl:"))
 async def cb_addpl(cb: CallbackQuery):
-    token = cb.data[6:]
+    token = cb.data[4:]
     meta = _meta_cache.get(token, {})
     title = meta.get("title", "Unknown")
     artist = meta.get("artist", "Unknown")
@@ -554,14 +572,11 @@ async def cb_addpl(cb: CallbackQuery):
     kb = InlineKeyboardBuilder()
     for pid, name in rows:
         # store token in cache with pid prefix
-        cb_data = f"addto:{pid}:{token}"
-        if len(cb_data) > 64:
-            cb_data = f"addto:{pid}:{token[:60-len(str(pid))]}"
-        kb.button(text=f"📁 {name}", callback_data=cb_data)
+        kb.button(text=f"📁 {name}", callback_data=f"at:{pid}:{token}")
     kb.adjust(1)
     await cb.message.answer("В какой плейлист добавить?", reply_markup=kb.as_markup())
 
-@router.callback_query(F.data.startswith("addto:"))
+@router.callback_query(F.data.startswith("at:"))
 async def cb_addto(cb: CallbackQuery):
     parts = cb.data.split(":")
     pid = int(parts[1])
@@ -569,7 +584,7 @@ async def cb_addto(cb: CallbackQuery):
     meta = _meta_cache.get(token, {})
     title = meta.get("title", "Unknown")
     artist = meta.get("artist", "Unknown")
-    url = _url_cache.get(token, "")
+    url = get_url(token) or _url_cache.get(token, "")
     with db() as conn:
         conn.execute("INSERT INTO playlist_tracks(playlist_id, title, artist, url) VALUES (?,?,?,?)",
                      (pid, title, artist, url))
