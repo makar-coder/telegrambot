@@ -30,11 +30,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 load_dotenv()
 
-print(f"TOKEN: {BOT_TOKEN[:10]}... ADMIN: {ADMIN_ID}", flush=True)
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-GENIUS_TOKEN = os.getenv("GENIUS_TOKEN", "")  # для текстов песен
+GENIUS_TOKEN = os.getenv("GENIUS_TOKEN", "")
+
+print(f"TOKEN: {str(BOT_TOKEN)[:10]}... ADMIN: {ADMIN_ID}", flush=True)
 
 logging.basicConfig(level=logging.INFO, filename="bot.log", filemode="a",
                     format="%(asctime)s %(levelname)s %(message)s")
