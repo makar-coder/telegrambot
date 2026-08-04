@@ -644,13 +644,28 @@ async def inline_search(inline: InlineQuery):
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
+async def health(request):
+    return web.Response(text="ok")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 async def main():
     init_db()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     logger.info("Bot started")
-    await dp.start_polling(bot)
+    await asyncio.gather(
+        start_web(),
+        dp.start_polling(bot)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
