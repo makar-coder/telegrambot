@@ -18,11 +18,12 @@ from yt_dlp import YoutubeDL
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
+    URLInputFile,
     Message, CallbackQuery, InlineQuery, InlineQueryResultAudio,
     InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
     InlineQueryResultArticle, InputTextMessageContent
 )
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -173,10 +174,10 @@ async def search_tracks(query: str, service: str = "youtube") -> List[Dict]:
 
     def _search():
         if service == "soundcloud":
-            search_query = f"scsearch8:{query}"
+            search_query = f"scsearch30:{query}"
         else:
             # youtube or ytmusic both use ytsearch, ytmusic just adds music context
-            search_query = f"ytsearch8:{query}"
+            search_query = f"ytsearch30:{query}"
 
         opts = {
             "quiet": True,
@@ -216,7 +217,7 @@ async def search_tracks(query: str, service: str = "youtube") -> List[Dict]:
                     "thumb": thumb,
                     "duration": e.get("duration", 0),
                 })
-                if len(results) >= 8:
+                if len(results) >= 30:
                     break
 
         print(f"SEARCH RESULTS: {len(results)} for '{query}' via {service}", flush=True)
@@ -251,31 +252,56 @@ async def download_track(url: str) -> Optional[str]:
     return await loop.run_in_executor(None, _dl)
 
 async def get_lyrics(title: str, artist: str) -> Optional[str]:
-    if not GENIUS_TOKEN:
-        return None
+    """Try multiple sources: Genius API -> Genius scrape -> lyrics.ovh"""
+    query = f"{artist} {title}".strip()
+
+    # Source 1: lyrics.ovh (free, no token needed)
     try:
-        async with ClientSession(timeout=ClientTimeout(total=10)) as session:
-            params = {"q": f"{artist} {title}"}
-            headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
-            async with session.get("https://api.genius.com/search",
-                                   params=params, headers=headers) as r:
-                data = await r.json()
-            hits = data.get("response", {}).get("hits", [])
-            if not hits:
-                return None
-            song_url = hits[0]["result"]["url"]
-            async with session.get(song_url) as r:
-                text = await r.text()
-            # грубый парсинг текста
-            matches = re.findall(r'<div[^>]*data-lyrics-container[^>]*>(.*?)</div>',
-                                 text, re.DOTALL)
-            if not matches:
-                return None
-            lyrics = re.sub(r'<[^>]+>', '\n', ''.join(matches))
-            lyrics = html.unescape(lyrics).strip()
-            return lyrics[:4000] if lyrics else None
+        async with ClientSession(timeout=ClientTimeout(total=8)) as session:
+            safe_artist = artist.replace("/", " ")
+            safe_title = title.replace("/", " ")
+            url = f"https://api.lyrics.ovh/v1/{safe_artist}/{safe_title}"
+            async with session.get(url) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    lyrics = data.get("lyrics", "").strip()
+                    if lyrics and len(lyrics) > 50:
+                        return lyrics[:4096]
     except Exception:
-        return None
+        pass
+
+    # Source 2: Genius API + scrape
+    if GENIUS_TOKEN:
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=10)) as session:
+                params = {"q": query}
+                headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
+                async with session.get("https://api.genius.com/search",
+                                       params=params, headers=headers) as r:
+                    data = await r.json()
+                hits = data.get("response", {}).get("hits", [])
+                if hits:
+                    song_url = hits[0]["result"]["url"]
+                    headers2 = {"User-Agent": "Mozilla/5.0 (compatible)"}
+                    async with session.get(song_url, headers=headers2) as r:
+                        text = await r.text()
+                    # extract all lyrics containers
+                    matches = re.findall(
+                        r'<div[^>]*data-lyrics-container[^>]*>(.*?)</div>',
+                        text, re.DOTALL
+                    )
+                    if matches:
+                        raw = ''.join(matches)
+                        raw = re.sub(r'<br\s*/?>', '\n', raw, flags=re.IGNORECASE)
+                        raw = re.sub(r'<[^>]+>', '', raw)
+                        lyrics = html.unescape(raw).strip()
+                        lyrics = re.sub(r'\n{3,}', '\n\n', lyrics)
+                        if lyrics and len(lyrics) > 50:
+                            return lyrics[:4096]
+        except Exception:
+            pass
+
+    return None
 
 # ─── FSM STATES ──────────────────────────────────────────────────────────────
 
@@ -314,14 +340,25 @@ def service_kb(user_id: int) -> InlineKeyboardMarkup:
     kb.adjust(1)
     return kb.as_markup()
 
-def search_results_kb(tracks: List[Dict]) -> InlineKeyboardMarkup:
+def search_results_kb(tracks: List[Dict], page: int = 0) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    for i, t in enumerate(tracks):
+    per_page = 8
+    start = page * per_page
+    page_tracks = tracks[start:start + per_page]
+    for t in page_tracks:
         token = store_url(t["url"])
         _url_cache[token] = t["url"]
         _meta_cache[token] = {"title": t["title"], "artist": t["uploader"]}
-        label = f"🎵 {t['title'][:40]}"
+        label = f"🎵 {t['title'][:30]} — {t['uploader'][:15]}"
         kb.button(text=label, callback_data=f"dl:{token}")
+    # pagination
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"pg:{page-1}"))
+    if start + per_page < len(tracks):
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"pg:{page+1}"))
+    if nav:
+        kb.row(*nav)
     kb.button(text="🏠 Главное меню", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -373,8 +410,7 @@ def admin_kb() -> InlineKeyboardMarkup:
 
 router = Router()
 
-@router.message(CommandStart())
-async def cmd_start(msg: Message, state: FSMContext):
+async def show_main_menu(msg: Message, state: FSMContext):
     register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     await state.clear()
     name = msg.from_user.first_name or "друг"
@@ -393,7 +429,86 @@ async def cmd_admin(msg: Message):
         return
     await msg.answer("🛠 <b>Админ панель</b>", reply_markup=admin_kb(), parse_mode="HTML")
 
+
+@router.message(CommandStart())
+async def cmd_start_dl(msg: Message, state: FSMContext, command: CommandObject = None):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    args = command.args if command and command.args else ""
+    if args.startswith("dl_"):
+        token = args[3:]
+        url = get_url(token) or _url_cache.get(token)
+        if not url:
+            await msg.answer("⚠️ Трек не найден. Сделай поиск заново.")
+            return
+        wait = await msg.answer("⏬ Загружаю трек...")
+        path = await download_track(url)
+        if not path or not os.path.exists(path):
+            await wait.edit_text("❌ Не удалось загрузить.")
+            return
+        meta = _meta_cache.get(token, {})
+        title = meta.get("title", "Unknown")
+        artist = meta.get("artist", "Unknown")
+        audio = FSInputFile(path, filename=f"{title}.mp3")
+        try:
+            await msg.answer_audio(audio, title=title[:64], performer=artist[:64],
+                caption=f"🎵 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}",
+                parse_mode="HTML", reply_markup=track_kb(token, title, artist, token))
+            await wait.delete()
+        except Exception as e:
+            await wait.edit_text(f"❌ {e}")
+        finally:
+            try: os.remove(path)
+            except: pass
+    else:
+        await show_main_menu(msg, state)
+
 # ─── MAIN MENU ───────────────────────────────────────────────────────────────
+
+
+@router.message(Command("search"))
+async def cmd_search(msg: Message, state: FSMContext):
+    await state.set_state(SearchState.waiting_query)
+    await msg.answer("🔍 Введи название песни или исполнителя:")
+
+@router.message(Command("playlists"))
+async def cmd_playlists(msg: Message):
+    await msg.answer("📂 <b>Твои плейлисты</b>", reply_markup=playlists_kb(msg.from_user.id), parse_mode="HTML")
+
+@router.message(Command("service"))
+async def cmd_service(msg: Message):
+    await msg.answer(
+        "⚙️ <b>Выбери источник музыки</b>\n\n"
+        "▶️ YouTube — всё подряд, максимальное покрытие\n"
+        "☁️ SoundCloud — инди, андеграунд, эксклюзивы",
+        reply_markup=service_kb(msg.from_user.id),
+        parse_mode="HTML"
+    )
+
+@router.message(Command("suggest"))
+async def cmd_suggest(msg: Message, state: FSMContext):
+    await state.set_state(SuggestionState.waiting_text)
+    await msg.answer("💡 Напиши своё предложение — какие песни добавить или что улучшить:")
+
+@router.message(Command("help"))
+async def cmd_help(msg: Message):
+    await msg.answer(
+        "❓ <b>Как пользоваться ботом</b>\n\n"
+        "1️⃣ Нажми <b>🔍 Начать поиск</b> или напиши /search\n"
+        "2️⃣ Введи название песни или исполнителя — например <i>Скалли Милано</i>\n"
+        "3️⃣ Выбери нужный трек из списка\n"
+        "4️⃣ Бот скачает и пришлёт mp3 прямо в чат\n\n"
+        "📂 <b>Плейлисты</b> — создавай списки и добавляй треки кнопкой <b>➕ В плейлист</b>\n"
+        "📝 <b>Текст</b> — жми <b>Показать текст</b> после получения трека\n"
+        "⚙️ <b>Источник</b> — выбирай между YouTube и SoundCloud через /service\n"
+        "👥 <b>В группах</b> — напиши <code>@{bot_username} название песни</code> прямо в чате\n\n"
+        "<b>Команды:</b>\n"
+        "/search — 🔍 Найти трек\n"
+        "/playlists — 📂 Мои плейлисты\n"
+        "/service — ⚙️ Источник музыки\n"
+        "/suggest — 💡 Предложить улучшение\n"
+        "/help — ❓ Эта справка",
+        parse_mode="HTML"
+    )
 
 @router.callback_query(F.data == "main_menu")
 async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
@@ -411,6 +526,9 @@ async def cb_search_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(SearchState.waiting_query)
     await cb.message.edit_text("🔍 Введи название песни или исполнителя:")
 
+# search results cache: user_id -> (query, tracks)
+_search_cache: Dict[int, dict] = {}
+
 @router.message(SearchState.waiting_query)
 async def handle_search(msg: Message, state: FSMContext):
     query = msg.text.strip()
@@ -423,11 +541,24 @@ async def handle_search(msg: Message, state: FSMContext):
         await wait.edit_text("❌ Ничего не нашёл. Попробуй другой запрос.",
                              reply_markup=main_menu_kb())
         return
-    for t in tracks:
-        token = encode_url(t["url"])
-        _url_cache[token[:60]] = t["url"]
-    text = f"🎵 <b>Результаты по запросу:</b> {html.escape(query)}\n\nВыбери трек:"
-    await wait.edit_text(text, reply_markup=search_results_kb(tracks), parse_mode="HTML")
+    _search_cache[msg.from_user.id] = {"query": query, "tracks": tracks, "page": 0}
+    text = f"🎵 <b>{html.escape(query)}</b> — найдено {len(tracks)} треков:\n\nВыбери трек:"
+    await wait.edit_text(text, reply_markup=search_results_kb(tracks, 0), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("pg:"))
+async def cb_pagination(cb: CallbackQuery):
+    page = int(cb.data[3:])
+    cache = _search_cache.get(cb.from_user.id)
+    if not cache:
+        await cb.answer("Сделай новый поиск", show_alert=True)
+        return
+    tracks = cache["tracks"]
+    query = cache["query"]
+    _search_cache[cb.from_user.id]["page"] = page
+    text = f"🎵 <b>{html.escape(query)}</b> — найдено {len(tracks)} треков:\n\nВыбери трек:"
+    await cb.message.edit_text(text, reply_markup=search_results_kb(tracks, page), parse_mode="HTML")
+    await cb.answer()
 
 # ─── DOWNLOAD ────────────────────────────────────────────────────────────────
 
@@ -455,10 +586,17 @@ async def cb_download(cb: CallbackQuery):
         try:
             with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
                 info = ydl.extract_info(url, download=False)
+                thumb = ""
+                thumbnails = info.get("thumbnails") or []
+                if thumbnails:
+                    # get highest quality
+                    thumb = thumbnails[-1].get("url", "")
+                elif info.get("thumbnail"):
+                    thumb = info.get("thumbnail", "")
                 return (
                     info.get("title", "Unknown"),
-                    info.get("uploader") or info.get("channel") or "Unknown",
-                    info.get("thumbnail", "")
+                    info.get("uploader") or info.get("channel") or info.get("artist") or "Unknown",
+                    thumb
                 )
         except Exception:
             return "Unknown", "Unknown", ""
@@ -477,6 +615,7 @@ async def cb_download(cb: CallbackQuery):
             performer=artist[:64],
             caption=f"🎵 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}",
             parse_mode="HTML",
+            thumbnail=URLInputFile(thumb) if thumb else None,
             reply_markup=track_kb(token, title, artist, token)
         )
         await wait.delete()
@@ -741,25 +880,30 @@ async def inline_search(inline: InlineQuery):
     if not query:
         await inline.answer([], cache_time=1)
         return
-    service = get_user_service(msg.from_user.id)
+    service = get_user_service(inline.from_user.id)
     tracks = await search_tracks(query, service)
     results = []
-    for i, t in enumerate(tracks[:5]):
-        token = encode_url(t["url"])
-        _url_cache[token[:60]] = t["url"]
+    for i, t in enumerate(tracks[:20]):
+        token = store_url(t["url"])
+        _url_cache[token] = t["url"]
+        _meta_cache[token] = {"title": t["title"], "artist": t["uploader"]}
+        duration = t.get("duration", 0)
+        thumb = t.get("thumb", "")
         results.append(
-            InlineQueryResultArticle(
+            InlineQueryResultAudio(
                 id=str(i),
-                title=t["title"],
-                description=t["uploader"],
-                input_message_content=InputTextMessageContent(
-                    message_text=f"🎵 <b>{html.escape(t['title'])}</b>\n👤 {html.escape(t['uploader'])}\n\n"
-                                 f"Отправить: /dl_{token[:40]}",
-                    parse_mode="HTML"
-                )
+                audio_url=t["url"] if t["url"].startswith("http") else f"https://soundcloud.com",
+                title=t["title"][:64],
+                performer=t["uploader"][:64],
+                audio_duration=duration,
+                caption=f"🎵 <b>{html.escape(t['title'])}</b>\n👤 {html.escape(t['uploader'])}\n\nНайдено ботом @{(await inline.bot.get_me()).username}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="⬇️ Скачать в ЛС", url=f"https://t.me/{(await inline.bot.get_me()).username}?start=dl_{token}")
+                ]])
             )
         )
-    await inline.answer(results, cache_time=30)
+    await inline.answer(results, cache_time=60, is_personal=True)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
@@ -782,6 +926,18 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="start",     description="🏠 Главное меню"),
+        BotCommand(command="search",    description="🔍 Найти трек"),
+        BotCommand(command="playlists", description="📂 Мои плейлисты"),
+        BotCommand(command="service",   description="⚙️ Источник музыки"),
+        BotCommand(command="suggest",   description="💡 Предложить улучшение"),
+        BotCommand(command="help",      description="❓ Помощь"),
+        BotCommand(command="admin",     description="🛠 Админ-панель"),
+    ])
+
     print("starting polling + web...", flush=True)
     logger.info("Bot started")
     await asyncio.gather(
