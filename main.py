@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Telegram-бот для скачивания и публикации видео (YouTube / TikTok / Instagram).
-Работает через вебхук на aiohttp, без aiogram. Хранение данных — в памяти.
-
-Запуск: python main.py
-"""
-
 import asyncio
 import html
 import json
@@ -14,643 +5,652 @@ import logging
 import os
 import re
 import time
+import base64
+import sqlite3
 from dataclasses import dataclass, field
 from itertools import count
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 from aiohttp import ClientSession, ClientTimeout, web
 from dotenv import load_dotenv
 from yt_dlp import YoutubeDL
 
-# --------------------------------------------------------------------------- #
-# Конфигурация
-# --------------------------------------------------------------------------- #
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import (
+    Message, CallbackQuery, InlineQuery, InlineQueryResultAudio,
+    InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
+    InlineQueryResultArticle, InputTextMessageContent
+)
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "") # опционально, для заголовка секрета Telegram
-PORT = int(os.getenv("PORT", "8080"))
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "black_ide")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "ne_otvechu_bot")
-
-if not BOT_TOKEN:
- raise RuntimeError("Не задан BOT_TOKEN в переменных окружения.")
-
-API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-FILE_API_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-logging.basicConfig(
- level=logging.INFO,
- format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("video-bot")
-
-SIGNATURE_HTML = f'<a href="https://t.me/{BOT_USERNAME}">@{BOT_USERNAME}</a>'
-
-URL_RE = re.compile(r"https?://\S+")
-SUPPORTED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com")
-
-MAX_TELEGRAM_UPLOAD_BYTES = 50 * 1024 * 1024 # ограничение обычного Bot API на файл
-
-
-# --------------------------------------------------------------------------- #
-# Модели данных (в памяти)
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class VideoItem:
- id: int
- title: str
- file_path: str
- saved_at: float
-
-
-@dataclass
-class UserState:
- user_id: int
- state: str = "idle" # idle | awaiting_link | awaiting_pick | awaiting_channel | awaiting_text
- videos: Dict[int, VideoItem] = field(default_factory=dict)
- next_video_id: "count" = field(default_factory=lambda: count(1))
- # временные данные текущего сценария публикации
- pending_video_id: Optional[int] = None
- pending_channel_id: Optional[str] = None
- last_menu_message_id: Optional[int] = None
-
-
-class Storage:
- """Простое in-memory хранилище состояний пользователей."""
-
- def __init__(self) -> None:
- self._users: Dict[int, UserState] = {}
-
- def get(self, user_id: int) -> UserState:
- if user_id not in self._users:
- self._users[user_id] = UserState(user_id=user_id)
- return self._users[user_id]
-
- def reset_scenario(self, user_id: int) -> None:
- u = self.get(user_id)
- u.state = "idle"
- u.pending_video_id = None
- u.pending_channel_id = None
-
-
-STORAGE = Storage()
-
-
-# --------------------------------------------------------------------------- #
-# Telegram API клиент (тонкая обёртка через aiohttp)
-# --------------------------------------------------------------------------- #
-
-class TelegramAPI:
- def __init__(self, session: ClientSession):
- self.session = session
-
- async def _post(self, method: str, payload: Optional[dict] = None, files: Optional[dict] = None) -> dict:
- url = f"{API_URL}/{method}"
- try:
- if files:
- form = aiohttp_form_data(payload or {}, files)
- async with self.session.post(url, data=form) as resp:
- data = await resp.json()
- else:
- async with self.session.post(url, json=payload or {}) as resp:
- data = await resp.json()
- except Exception:
- log.exception("Ошибка HTTP-запроса к методу %s", method)
- return {"ok": False, "description": "network_error"}
-
- if not data.get("ok"):
- log.warning("Telegram API %s вернул ошибку: %s", method, data)
- return data
-
- async def send_message(
- self,
- chat_id: Any,
- text: str,
- reply_markup: Optional[dict] = None,
- disable_web_page_preview: bool = True,
- ) -> dict:
- payload = {
- "chat_id": chat_id,
- "text": text,
- "parse_mode": "HTML",
- "disable_web_page_preview": disable_web_page_preview,
- }
- if reply_markup is not None:
- payload["reply_markup"] = reply_markup
- return await self._post("sendMessage", payload)
-
- async def edit_message_text(
- self,
- chat_id: Any,
- message_id: int,
- text: str,
- reply_markup: Optional[dict] = None,
- ) -> dict:
- payload = {
- "chat_id": chat_id,
- "message_id": message_id,
- "text": text,
- "parse_mode": "HTML",
- "disable_web_page_preview": True,
- }
- if reply_markup is not None:
- payload["reply_markup"] = reply_markup
- return await self._post("editMessageText", payload)
-
- async def answer_callback_query(self, callback_query_id: str, text: Optional[str] = None, show_alert: bool = False) -> dict:
- payload: Dict[str, Any] = {"callback_query_id": callback_query_id}
- if text:
- payload["text"] = text
- payload["show_alert"] = show_alert
- return await self._post("answerCallbackQuery", payload)
-
- async def send_video_from_file(
- self,
- chat_id: Any,
- file_path: str,
- caption: Optional[str] = None,
- reply_markup: Optional[dict] = None,
- ) -> dict:
- payload: Dict[str, Any] = {"chat_id": str(chat_id)}
- if caption:
- payload["caption"] = caption
- payload["parse_mode"] = "HTML"
- if reply_markup is not None:
- payload["reply_markup"] = json.dumps(reply_markup)
-
- with open(file_path, "rb") as f:
- file_bytes = f.read()
-
- files = {"video": (os.path.basename(file_path), file_bytes, "video/mp4")}
- return await self._post("sendVideo", payload, files=files)
-
- async def get_chat_member(self, chat_id: Any, user_id: int) -> dict:
- payload = {"chat_id": chat_id, "user_id": user_id}
- return await self._post("getChatMember", payload)
-
- async def get_me(self) -> dict:
- return await self._post("getMe")
-
- async def set_webhook(self, url: str, secret_token: Optional[str] = None) -> dict:
- payload: Dict[str, Any] = {"url": url, "allowed_updates": ["message", "callback_query"]}
- if secret_token:
- payload["secret_token"] = secret_token
- return await self._post("setWebhook", payload)
-
-
-def aiohttp_form_data(payload: dict, files: dict):
- from aiohttp import FormData
-
- form = FormData()
- for key, value in payload.items():
- if value is None:
- continue
- form.add_field(key, str(value))
- for field_name, (filename, content, content_type) in files.items():
- form.add_field(field_name, content, filename=filename, content_type=content_type)
- return form
-
-
-# --------------------------------------------------------------------------- #
-# Клавиатуры
-# --------------------------------------------------------------------------- #
-
-def main_menu_keyboard() -> dict:
- return {
- "inline_keyboard": [
- [{"text": "📥 Скачать видео", "callback_data": "menu:download"}],
- [{"text": "🆘 Поддержка", "url": f"https://t.me/{SUPPORT_USERNAME}"}],
- ]
- }
-
-
-def back_to_menu_keyboard() -> dict:
- return {
- "inline_keyboard": [
- [{"text": "⬅️ В главное меню", "callback_data": "menu:main"}],
- ]
- }
-
-
-def after_download_keyboard(video_id: int) -> dict:
- return {
- "inline_keyboard": [
- [{"text": "📤 Опубликовать в канал", "callback_data": f"publish:start:{video_id}"}],
- [{"text": "⬅️ В главное меню", "callback_data": "menu:main"}],
- ]
- }
-
-
-def library_keyboard(videos: List[VideoItem]) -> dict:
- rows = []
- for v in videos:
- rows.append([{"text": f"🎬 №{v.id} — {v.title[:40]}", "callback_data": f"publish:pick:{v.id}"}])
- rows.append([{"text": "⬅️ В главное меню", "callback_data": "menu:main"}])
- return {"inline_keyboard": rows}
-
-
-def cancel_keyboard() -> dict:
- return {
- "inline_keyboard": [
- [{"text": "❌ Отмена", "callback_data": "menu:main"}],
- ]
- }
-
-
-# --------------------------------------------------------------------------- #
-# Тексты
-# --------------------------------------------------------------------------- #
-
-WELCOME_TEXT = (
- "✨ <b>Добро пожаловать!</b>\n\n"
- "Я помогу тебе скачать видео с <b>YouTube</b>, <b>TikTok</b> и <b>Instagram</b>, "
- "а затем опубликовать его в свой канал одним нажатием кнопки.\n\n"
- "Выбери действие ниже 👇"
-)
-
-ASK_LINK_TEXT = (
- "🔗 <b>Отправь ссылку на видео</b>\n\n"
- "Поддерживаются: YouTube, TikTok, Instagram.\n"
- "Просто вставь ссылку в чат."
-)
-
-DOWNLOADING_TEXT = "⏳ <b>Скачиваю видео…</b> Это может занять до минуты."
-
-EMPTY_LIBRARY_TEXT = (
- "📭 <b>Библиотека пуста</b>\n\n"
- "Сначала скачай хотя бы одно видео через «📥 Скачать видео»."
-)
-
-ASK_CHANNEL_TEXT = (
- "📡 <b>Введи ID канала</b>\n\n"
- "Например: <code>-1001234567890</code>\n"
- "Бот должен быть добавлен в канал как <b>администратор</b>."
-)
-
-ASK_TEXT_TEXT = (
- "✍️ <b>Введи текст для поста</b>\n\n"
- "Он будет опубликован вместе с видео. Подпись бота добавится автоматически."
-)
-
-
-# --------------------------------------------------------------------------- #
-# yt-dlp скачивание
-# --------------------------------------------------------------------------- #
-
-def is_supported_url(url: str) -> bool:
- return any(host in url for host in SUPPORTED_HOSTS)
-
-
-def download_video_sync(url: str, out_dir: str) -> Dict[str, Any]:
- """Синхронная функция скачивания (запускается в executor)."""
- timestamp = int(time.time() * 1000)
- out_template = os.path.join(out_dir, f"%(id)s_{timestamp}.%(ext)s")
-
- ydl_opts = {
- "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
- "outtmpl": out_template,
- "merge_output_format": "mp4",
- "quiet": True,
- "no_warnings": True,
- "noplaylist": True,
- "restrictfilenames": True,
- "max_filesize": MAX_TELEGRAM_UPLOAD_BYTES,
- }
-
- with YoutubeDL(ydl_opts) as ydl:
- info = ydl.extract_info(url, download=True)
- file_path = ydl.prepare_filename(info)
- # merge_output_format может поменять расширение на mp4
- if not os.path.exists(file_path):
- base, _ = os.path.splitext(file_path)
- candidate = base + ".mp4"
- if os.path.exists(candidate):
- file_path = candidate
-
- title = info.get("title") or "Видео"
- return {"file_path": file_path, "title": title}
-
-
-async def download_video(url: str) -> Dict[str, Any]:
- loop = asyncio.get_running_loop()
- return await loop.run_in_executor(None, download_video_sync, url, DOWNLOAD_DIR)
-
-
-# --------------------------------------------------------------------------- #
-# Обработчики бизнес-логики
-# --------------------------------------------------------------------------- #
-
-class Bot:
- def __init__(self, api: TelegramAPI):
- self.api = api
-
- # ---------- Главное меню ---------- #
-
- async def show_main_menu(self, chat_id: int, edit_message_id: Optional[int] = None) -> None:
- STORAGE.reset_scenario(chat_id)
- if edit_message_id:
- res = await self.api.edit_message_text(chat_id, edit_message_id, WELCOME_TEXT, main_menu_keyboard())
- if res.get("ok"):
- return
- await self.api.send_message(chat_id, WELCOME_TEXT, main_menu_keyboard())
-
- # ---------- Скачивание ---------- #
-
- async def start_download_flow(self, chat_id: int, message_id: Optional[int] = None) -> None:
- user = STORAGE.get(chat_id)
- user.state = "awaiting_link"
- if message_id:
- res = await self.api.edit_message_text(chat_id, message_id, ASK_LINK_TEXT, cancel_keyboard())
- if res.get("ok"):
- return
- await self.api.send_message(chat_id, ASK_LINK_TEXT, cancel_keyboard())
-
- async def handle_link_message(self, chat_id: int, text: str) -> None:
- match = URL_RE.search(text or "")
- if not match:
- await self.api.send_message(
- chat_id,
- "⚠️ <b>Это не похоже на ссылку.</b>\nПопробуй ещё раз или отмени действие.",
- cancel_keyboard(),
- )
- return
-
- url = match.group(0)
- if not is_supported_url(url):
- await self.api.send_message(
- chat_id,
- "⚠️ <b>Платформа не поддерживается.</b>\nПришли ссылку с YouTube, TikTok или Instagram.",
- cancel_keyboard(),
- )
- return
-
- status_msg = await self.api.send_message(chat_id, DOWNLOADING_TEXT)
- status_message_id = status_msg.get("result", {}).get("message_id")
-
- try:
- result = await download_video(url)
- except Exception as exc:
- log.exception("Ошибка скачивания видео по ссылке %s", url)
- err_text = (
- "❌ <b>Не удалось скачать видео.</b>\n\n"
- f"<i>{html.escape(str(exc))[:300]}</i>"
- )
- if status_message_id:
- await self.api.edit_message_text(chat_id, status_message_id, err_text, back_to_menu_keyboard())
- else:
- await self.api.send_message(chat_id, err_text, back_to_menu_keyboard())
- STORAGE.reset_scenario(chat_id)
- return
-
- file_path = result["file_path"]
- title = result["title"]
-
- try:
- file_size = os.path.getsize(file_path)
- except OSError:
- file_size = 0
-
- if file_size > MAX_TELEGRAM_UPLOAD_BYTES:
- await self.api.edit_message_text(
- chat_id,
- status_message_id,
- "❌ <b>Видео слишком большое</b> для отправки через Telegram (лимит 50 МБ).",
- back_to_menu_keyboard(),
- ) if status_message_id else await self.api.send_message(
- chat_id, "❌ <b>Видео слишком большое</b> для отправки через Telegram (лимит 50 МБ).", back_to_menu_keyboard()
- )
- os.remove(file_path)
- STORAGE.reset_scenario(chat_id)
- return
-
- user = STORAGE.get(chat_id)
- video_id = next(user.next_video_id)
- user.videos[video_id] = VideoItem(
- id=video_id,
- title=title,
- file_path=file_path,
- saved_at=time.time(),
- )
-
- caption = f"✅ <b>{html.escape(title)}</b>\n\nСохранено в библиотеку под №{video_id}."
- send_res = await self.api.send_video_from_file(chat_id, file_path, caption=caption)
-
- if status_message_id:
- if send_res.get("ok"):
- await self.api.edit_message_text(
- chat_id, status_message_id, "✅ <b>Готово!</b> Видео отправлено выше.", after_download_keyboard(video_id)
- )
- else:
- await self.api.edit_message_text(
- chat_id,
- status_message_id,
- "⚠️ <b>Видео скачано, но не удалось отправить его в чат.</b>\nПопробуй опубликовать в канал.",
- after_download_keyboard(video_id),
- )
- else:
- await self.api.send_message(chat_id, "Что дальше?", after_download_keyboard(video_id))
-
- STORAGE.reset_scenario(chat_id)
-
- # ---------- Публикация в канал ---------- #
-
- async def start_publish_flow(self, chat_id: int, message_id: Optional[int], preselected_video_id: Optional[int] = None) -> None:
- user = STORAGE.get(chat_id)
-
- if preselected_video_id is not None and preselected_video_id in user.videos:
- user.pending_video_id = preselected_video_id
- user.state = "awaiting_channel"
- text = ASK_CHANNEL_TEXT
- keyboard = cancel_keyboard()
- else:
- if not user.videos:
- text = EMPTY_LIBRARY_TEXT
- keyboard = back_to_menu_keyboard()
- user.state = "idle"
- else:
- text = "📚 <b>Выбери видео из библиотеки:</b>"
- keyboard = library_keyboard(list(user.videos.values()))
- user.state = "awaiting_pick"
-
- if message_id:
- res = await self.api.edit_message_text(chat_id, message_id, text, keyboard)
- if res.get("ok"):
- return
- await self.api.send_message(chat_id, text, keyboard)
-
- async def handle_pick_video(self, chat_id: int, video_id: int, message_id: Optional[int]) -> None:
- user = STORAGE.get(chat_id)
- if video_id not in user.videos:
- await self.api.answer_callback_query_safe(None)
- return
- user.pending_video_id = video_id
- user.state = "awaiting_channel"
- if message_id:
- res = await self.api.edit_message_text(chat_id, message_id, ASK_CHANNEL_TEXT, cancel_keyboard())
- if res.get("ok"):
- return
- await self.api.send_message(chat_id, ASK_CHANNEL_TEXT, cancel_keyboard())
-
- async def handle_channel_message(self, chat_id: int, text: str) -> None:
- user = STORAGE.get(chat_id)
- channel_id = (text or "").strip()
-
- if not re.match(r"^-?\d+$", channel_id) and not channel_id.startswith("@"):
- await self.api.send_message(
- chat_id,
- "⚠️ <b>Некорректный ID канала.</b>\nПример: <code>-1001234567890</code> или <code>@channel_username</code>.",
- cancel_keyboard(),
- )
- return
-
- me = await self.api.get_me()
- bot_id = me.get("result", {}).get("id")
-
- member_res = await self.api.get_chat_member(channel_id, bot_id)
- if not member_res.get("ok"):
- desc = member_res.get("description", "неизвестная ошибка")
- await self.api.send_message(
- chat_id,
- f"❌ <b>Не удалось проверить доступ к каналу.</b>\n<i>{html.escape(desc)}</i>\n\n"
- "Убедись, что бот добавлен в канал.",
- cancel_keyboard(),
- )
- return
-
- status = member_res.get("result", {}).get("status")
- if status not in ("administrator", "creator"):
- await self.api.send_message(
- chat_id,
- "❌ <b>Бот не является администратором этого канала.</b>\n"
- "Добавь бота в администраторы и попробуй снова.",
- cancel_keyboard(),
- )
- return
-
- user.pending_channel_id = channel_id
- user.state = "awaiting_text"
- await self.api.send_message(chat_id, ASK_TEXT_TEXT, cancel_keyboard())
-
- async def handle_post_text_message(self, chat_id: int, text: str) -> None:
- user = STORAGE.get(chat_id)
- video_id = user.pending_video_id
- channel_id = user.pending_channel_id
-
- if video_id is None or channel_id is None or video_id not in user.videos:
- await self.api.send_message(chat_id, "⚠️ <b>Сессия публикации истекла.</b> Начни заново.", back_to_menu_keyboard())
- STORAGE.reset_scenario(chat_id)
- return
-
- video = user.videos[video_id]
- user_text = html.escape(text or "")
- caption = f"{user_text}\n\n{SIGNATURE_HTML}" if user_text.strip() else SIGNATURE_HTML
-
- if not os.path.exists(video.file_path):
- await self.api.send_message(
- chat_id, "❌ <b>Файл видео не найден.</b> Возможно, бот перезапускался.", back_to_menu_keyboard()
- )
- STORAGE.reset_scenario(chat_id)
- return
-
- send_res = await self.api.send_video_from_file(channel_id, video.file_path, caption=caption)
-
- if send_res.get("ok"):
- await self.api.send_message(
- chat_id,
- f"✅ <b>Видео опубликовано в канал!</b>\n\nID видео: №{video_id}",
- main_menu_keyboard(),
- )
- else:
- desc = send_res.get("description", "неизвестная ошибка")
- await self.api.send_message(
- chat_id,
- f"❌ <b>Не удалось опубликовать видео.</b>\n<i>{html.escape(desc)}</i>",
- back_to_menu_keyboard(),
- )
-
- STORAGE.reset_scenario(chat_id)
-
-
-# небольшой хелпер, чтобы answerCallbackQuery можно было безопасно "проглотить"
-async def _noop(*_args, **_kwargs):
- return {"ok": True}
-
-
-TelegramAPI.answer_callback_query_safe = _noop # type: ignore[attr-defined]
-
-
-# --------------------------------------------------------------------------- #
-# Роутинг обновлений Telegram
-# --------------------------------------------------------------------------- #
-
-class UpdateRouter:
- def __init__(self, bot: Bot, api: TelegramAPI):
- self.bot = bot
- self.api = api
-
- async def handle_update(self, update: dict) -> None:
- try:
- if "callback_query" in update:
- await self._handle_callback_query(update["callback_query"])
- elif "message" in update:
- await self._handle_message(update["message"])
- except Exception:
- log.exception("Ошибка при обработке обновления: %s", update)
-
- async def _handle_callback_query(self, cq: dict) -> None:
- callback_id = cq.get("id")
- data = cq.get("data", "")
- message = cq.get("from") or {}
- chat = cq.get("message", {}).get("chat", {})
- chat_id = chat.get("id")
- message_id = cq.get("message", {}).get("message_id")
-
- if chat_id is None:
- await self.api.answer_callback_query(callback_id)
- return
-
- await self.api.answer_callback_query(callback_id)
-
- if data == "menu:main":
- await self.bot.show_main_menu(chat_id, edit_message_id=message_id)
- elif data == "menu:download":
- await self.bot.start_download_flow(chat_id, message_id=message_id)
- elif data.startswith("publish:start:"):
- video_id = int(data.split(":")[-1])
- await self.bot.start_publish_flow(chat_id, message_id, preselected_video_id=video_id)
- elif data == "publish:start":
- await self.bot.start_publish_flow(chat_id, message_id)
- elif data.startswith("publish:pick:"):
- video_id = int(data.split(":")[-1])
- await self.bot.handle_pick_video(chat_id, video_id, message_id)
- else:
- log.warning("Неизвестный callback_data: %s", data)
-
- async def _handle_message(self, message: dict) -> None:
- chat = message.get("chat", {})
- chat_id = chat.get("id")
- text = message.get("text", "")
-
- if chat_id is None:
- return
-
- if text == "/start" or text == "/menu":
- await self.bot.show_main_menu(chat_id)
- return
-
- user = STORAGE.get(chat_id)
-
- if user.state == "awaiting_link":
- await self.bot.handle_link_message(chat_id, text)
- elif user.state == "awaiting_pick":
- if text.strip().isdigit():
- await self.bot.handle_pick_video(chat_id, int(text.strip()), message_id=None)
- else:
- await self.api.
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+GENIUS_TOKEN = os.getenv("GENIUS_TOKEN", "")  # для текстов песен
+
+logging.basicConfig(level=logging.INFO, filename="bot.log", filemode="a",
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# ─── DATABASE ────────────────────────────────────────────────────────────────
+
+def init_db():
+    conn = sqlite3.connect("music.db")
+    c = conn.cursor()
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            joined_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS searches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            query TEXT,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS playlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS playlist_tracks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            playlist_id INTEGER,
+            title TEXT,
+            artist TEXT,
+            url TEXT,
+            thumb TEXT
+        );
+        CREATE TABLE IF NOT EXISTS suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            text TEXT,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS stats (
+            key TEXT PRIMARY KEY,
+            value INTEGER DEFAULT 0
+        );
+    """)
+    # init stats keys
+    for key in ("total_users", "total_searches", "total_downloads"):
+        c.execute("INSERT OR IGNORE INTO stats(key, value) VALUES (?, 0)", (key,))
+    conn.commit()
+    conn.close()
+
+def db():
+    return sqlite3.connect("music.db")
+
+def register_user(user_id, username, first_name):
+    with db() as conn:
+        c = conn.cursor()
+        existing = c.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+        if not existing:
+            c.execute("INSERT INTO users VALUES (?,?,?,?)",
+                      (user_id, username, first_name, datetime.now().isoformat()))
+            c.execute("UPDATE stats SET value=value+1 WHERE key='total_users'")
+            conn.commit()
+
+def log_search(user_id, query):
+    with db() as conn:
+        conn.execute("INSERT INTO searches(user_id, query, ts) VALUES (?,?,?)",
+                     (user_id, query, datetime.now().isoformat()))
+        conn.execute("UPDATE stats SET value=value+1 WHERE key='total_searches'")
+        conn.commit()
+
+def get_stats() -> dict:
+    with db() as conn:
+        c = conn.cursor()
+        rows = c.execute("SELECT key, value FROM stats").fetchall()
+        stats = dict(rows)
+        stats["total_playlists"] = c.execute("SELECT COUNT(*) FROM playlists").fetchone()[0]
+        stats["total_suggestions"] = c.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0]
+        return stats
+
+def get_all_searches_txt() -> str:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT u.first_name, s.query, s.ts FROM searches s "
+            "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.ts DESC LIMIT 1000"
+        ).fetchall()
+    lines = [f"{ts} | {name or 'unknown'} | {q}" for name, q, ts in rows]
+    return "\n".join(lines)
+
+# ─── YT-DLP SEARCH & DOWNLOAD ────────────────────────────────────────────────
+
+def encode_url(url: str) -> str:
+    return base64.urlsafe_b64encode(url.encode()).decode()
+
+def decode_url(token: str) -> str:
+    return base64.urlsafe_b64decode(token.encode()).decode()
+
+def ydl_opts_search(query: str, max_results: int = 8):
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "default_search": f"ytsearch{max_results}",
+        "format": "bestaudio/best",
+    }
+
+async def search_tracks(query: str) -> List[Dict]:
+    loop = asyncio.get_event_loop()
+    def _search():
+        with YoutubeDL(ydl_opts_search(query)) as ydl:
+            info = ydl.extract_info(query, download=False)
+            entries = info.get("entries", [])
+            results = []
+            for e in entries:
+                if not e:
+                    continue
+                results.append({
+                    "title": e.get("title", "Unknown"),
+                    "uploader": e.get("uploader") or e.get("channel") or "Unknown",
+                    "url": e.get("url") or e.get("webpage_url", ""),
+                    "thumb": e.get("thumbnail", ""),
+                    "duration": e.get("duration", 0),
+                })
+            return results
+    return await loop.run_in_executor(None, _search)
+
+async def download_track(url: str) -> Optional[str]:
+    loop = asyncio.get_event_loop()
+    out_path = f"/tmp/track_{int(time.time())}"
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": out_path + ".%(ext)s",
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    }
+    def _dl():
+        with YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        mp3 = out_path + ".mp3"
+        if os.path.exists(mp3):
+            return mp3
+        for f in os.listdir("/tmp"):
+            if f.startswith(f"track_{out_path.split('_')[-1]}"):
+                return f"/tmp/{f}"
+        return None
+    return await loop.run_in_executor(None, _dl)
+
+async def get_lyrics(title: str, artist: str) -> Optional[str]:
+    if not GENIUS_TOKEN:
+        return None
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=10)) as session:
+            params = {"q": f"{artist} {title}"}
+            headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
+            async with session.get("https://api.genius.com/search",
+                                   params=params, headers=headers) as r:
+                data = await r.json()
+            hits = data.get("response", {}).get("hits", [])
+            if not hits:
+                return None
+            song_url = hits[0]["result"]["url"]
+            async with session.get(song_url) as r:
+                text = await r.text()
+            # грубый парсинг текста
+            matches = re.findall(r'<div[^>]*data-lyrics-container[^>]*>(.*?)</div>',
+                                 text, re.DOTALL)
+            if not matches:
+                return None
+            lyrics = re.sub(r'<[^>]+>', '\n', ''.join(matches))
+            lyrics = html.unescape(lyrics).strip()
+            return lyrics[:4000] if lyrics else None
+    except Exception:
+        return None
+
+# ─── FSM STATES ──────────────────────────────────────────────────────────────
+
+class SearchState(StatesGroup):
+    waiting_query = State()
+
+class PlaylistState(StatesGroup):
+    waiting_name = State()
+
+class SuggestionState(StatesGroup):
+    waiting_text = State()
+
+# ─── KEYBOARDS ───────────────────────────────────────────────────────────────
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔍 Начать поиск", callback_data="search_start")
+    kb.button(text="📂 Плейлисты", callback_data="playlists_menu")
+    kb.button(text="💡 Предложения", callback_data="suggest_start")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def search_results_kb(tracks: List[Dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for i, t in enumerate(tracks):
+        token = encode_url(t["url"])
+        label = f"🎵 {t['title'][:40]}"
+        kb.button(text=label, callback_data=f"dl:{token[:60]}")
+    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def track_kb(token: str, title: str, artist: str, playlist_token: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📝 Показать текст", callback_data=f"lyrics:{token[:60]}:{title[:20]}:{artist[:20]}")
+    kb.button(text="➕ В плейлист", callback_data=f"addpl:{token[:60]}:{title[:20]}:{artist[:20]}")
+    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def playlists_kb(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    with db() as conn:
+        rows = conn.execute("SELECT id, name FROM playlists WHERE user_id=?",
+                            (user_id,)).fetchall()
+    for pid, name in rows:
+        kb.button(text=f"📁 {name}", callback_data=f"pl_open:{pid}")
+    kb.button(text="➕ Создать плейлист", callback_data="pl_create")
+    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def playlist_tracks_kb(pid: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    with db() as conn:
+        rows = conn.execute("SELECT id, title FROM playlist_tracks WHERE playlist_id=?",
+                            (pid,)).fetchall()
+    for tid, title in rows:
+        kb.button(text=f"🎵 {title[:35]}", callback_data=f"pl_play:{tid}")
+    kb.button(text="🗑 Удалить плейлист", callback_data=f"pl_delete:{pid}")
+    kb.button(text="◀️ Назад", callback_data="playlists_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def admin_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Статистика", callback_data="admin_stats")
+    kb.button(text="📥 Скачать статистику TXT", callback_data="admin_dl_stats")
+    kb.button(text="📋 Скачать логи", callback_data="admin_dl_logs")
+    kb.button(text="💌 Предложения пользователей", callback_data="admin_suggestions")
+    kb.adjust(1)
+    return kb.as_markup()
+
+# ─── ROUTER ──────────────────────────────────────────────────────────────────
+
+router = Router()
+
+@router.message(CommandStart())
+async def cmd_start(msg: Message, state: FSMContext):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    await state.clear()
+    name = msg.from_user.first_name or "друг"
+    await msg.answer(
+        f"👋 Привет, {name}!\n\n"
+        "🎶 <b>Я музыкальный бот</b> — нахожу и скидываю треки прямо сюда.\n"
+        "Все версии — оригинальные, без цензуры.\n\n"
+        "Выбери что хочешь сделать:",
+        reply_markup=main_menu_kb(),
+        parse_mode="HTML"
+    )
+
+@router.message(Command("admin"))
+async def cmd_admin(msg: Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    await msg.answer("🛠 <b>Админ панель</b>", reply_markup=admin_kb(), parse_mode="HTML")
+
+# ─── MAIN MENU ───────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "main_menu")
+async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text(
+        "🎶 <b>Главное меню</b>\n\nВыбери действие:",
+        reply_markup=main_menu_kb(),
+        parse_mode="HTML"
+    )
+
+# ─── SEARCH ──────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "search_start")
+async def cb_search_start(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SearchState.waiting_query)
+    await cb.message.edit_text("🔍 Введи название песни или исполнителя:")
+
+@router.message(SearchState.waiting_query)
+async def handle_search(msg: Message, state: FSMContext):
+    query = msg.text.strip()
+    await state.clear()
+    log_search(msg.from_user.id, query)
+    wait = await msg.answer("⏳ Ищу треки...")
+    tracks = await search_tracks(query)
+    if not tracks:
+        await wait.edit_text("❌ Ничего не нашёл. Попробуй другой запрос.",
+                             reply_markup=main_menu_kb())
+        return
+    # сохраняем треки во временный стор
+    tracks_data = json.dumps(tracks, ensure_ascii=False)
+    text = f"🎵 <b>Результаты по запросу:</b> {html.escape(query)}\n\nВыбери трек:"
+    await wait.edit_text(text, reply_markup=search_results_kb(tracks), parse_mode="HTML")
+
+# ─── DOWNLOAD ────────────────────────────────────────────────────────────────
+
+# Хранилище url по токену (в памяти, достаточно для сессии)
+_url_cache: Dict[str, str] = {}
+
+@router.callback_query(F.data == "search_start")
+async def cb_search_again(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SearchState.waiting_query)
+    await cb.message.edit_text("🔍 Введи название песни или исполнителя:")
+
+@router.callback_query(F.data.startswith("dl:"))
+async def cb_download(cb: CallbackQuery):
+    token = cb.data[3:]
+    # ищем полный url по короткому токену
+    full_token = next((k for k in _url_cache if k.startswith(token)), None)
+    if not full_token:
+        await cb.answer("⚠️ Трек устарел, сделай новый поиск", show_alert=True)
+        return
+    url = _url_cache[full_token]
+    await cb.answer("⏳ Скачиваю...")
+    wait = await cb.message.answer("⏬ Загружаю трек, подожди...")
+    path = await download_track(url)
+    if not path or not os.path.exists(path):
+        await wait.edit_text("❌ Не удалось загрузить трек.")
+        return
+
+    # получаем мета через yt-dlp
+    def get_meta():
+        with YoutubeDL({"quiet": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("title", "Unknown"), info.get("uploader", "Unknown"), info.get("thumbnail", "")
+    
+    loop = asyncio.get_event_loop()
+    title, artist, thumb = await loop.run_in_executor(None, get_meta)
+
+    with db() as conn:
+        conn.execute("UPDATE stats SET value=value+1 WHERE key='total_downloads'")
+        conn.commit()
+
+    short_token = full_token[:60]
+    audio = FSInputFile(path, filename=f"{title}.mp3")
+    await cb.message.answer_audio(
+        audio,
+        title=title,
+        performer=artist,
+        caption=f"🎵 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}",
+        parse_mode="HTML",
+        reply_markup=track_kb(short_token, title, artist, short_token)
+    )
+    await wait.delete()
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+# ─── LYRICS ──────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("lyrics:"))
+async def cb_lyrics(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    title = parts[2] if len(parts) > 2 else "Unknown"
+    artist = parts[3] if len(parts) > 3 else "Unknown"
+    await cb.answer("⏳ Ищу текст...")
+    lyrics = await get_lyrics(title, artist)
+    if not lyrics:
+        await cb.message.answer("❌ Текст не найден.")
+        return
+    await cb.message.answer(
+        f"📝 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}\n\n{html.escape(lyrics)}",
+        parse_mode="HTML"
+    )
+
+# ─── PLAYLISTS ───────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "playlists_menu")
+async def cb_playlists(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "📂 <b>Твои плейлисты</b>",
+        reply_markup=playlists_kb(cb.from_user.id),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "pl_create")
+async def cb_pl_create(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(PlaylistState.waiting_name)
+    await cb.message.edit_text("✏️ Введи название нового плейлиста:")
+
+@router.message(PlaylistState.waiting_name)
+async def handle_pl_name(msg: Message, state: FSMContext):
+    await state.clear()
+    with db() as conn:
+        conn.execute("INSERT INTO playlists(user_id, name, created_at) VALUES (?,?,?)",
+                     (msg.from_user.id, msg.text.strip(), datetime.now().isoformat()))
+        conn.commit()
+    await msg.answer(f"✅ Плейлист <b>{html.escape(msg.text.strip())}</b> создан!",
+                     reply_markup=playlists_kb(msg.from_user.id), parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("pl_open:"))
+async def cb_pl_open(cb: CallbackQuery):
+    pid = int(cb.data.split(":")[1])
+    with db() as conn:
+        name = conn.execute("SELECT name FROM playlists WHERE id=?", (pid,)).fetchone()
+    if not name:
+        await cb.answer("Плейлист не найден")
+        return
+    await cb.message.edit_text(
+        f"📁 <b>{html.escape(name[0])}</b>",
+        reply_markup=playlist_tracks_kb(pid),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("pl_delete:"))
+async def cb_pl_delete(cb: CallbackQuery):
+    pid = int(cb.data.split(":")[1])
+    with db() as conn:
+        conn.execute("DELETE FROM playlists WHERE id=?", (pid,))
+        conn.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (pid,))
+        conn.commit()
+    await cb.message.edit_text("🗑 Плейлист удалён.", reply_markup=playlists_kb(cb.from_user.id))
+
+@router.callback_query(F.data.startswith("addpl:"))
+async def cb_addpl(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    token = parts[1]
+    title = parts[2] if len(parts) > 2 else "Unknown"
+    artist = parts[3] if len(parts) > 3 else "Unknown"
+    url = _url_cache.get(token, "")
+    user_id = cb.from_user.id
+    with db() as conn:
+        rows = conn.execute("SELECT id, name FROM playlists WHERE user_id=?",
+                            (user_id,)).fetchall()
+    if not rows:
+        await cb.answer("У тебя нет плейлистов. Создай сначала!", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    for pid, name in rows:
+        kb.button(text=f"📁 {name}", callback_data=f"addto:{pid}:{token}:{title}:{artist}")
+    kb.adjust(1)
+    await cb.message.answer("В какой плейлист добавить?", reply_markup=kb.as_markup())
+
+@router.callback_query(F.data.startswith("addto:"))
+async def cb_addto(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    pid = int(parts[1])
+    token = parts[2]
+    title = parts[3] if len(parts) > 3 else "Unknown"
+    artist = parts[4] if len(parts) > 4 else "Unknown"
+    url = _url_cache.get(token, "")
+    with db() as conn:
+        conn.execute("INSERT INTO playlist_tracks(playlist_id, title, artist, url) VALUES (?,?,?,?)",
+                     (pid, title, artist, url))
+        conn.commit()
+    await cb.answer("✅ Добавлено в плейлист!", show_alert=True)
+
+@router.callback_query(F.data.startswith("pl_play:"))
+async def cb_pl_play(cb: CallbackQuery):
+    tid = int(cb.data.split(":")[1])
+    with db() as conn:
+        row = conn.execute("SELECT title, artist, url FROM playlist_tracks WHERE id=?",
+                           (tid,)).fetchone()
+    if not row:
+        await cb.answer("Трек не найден")
+        return
+    title, artist, url = row
+    await cb.answer("⏳ Загружаю...")
+    wait = await cb.message.answer("⏬ Загружаю трек из плейлиста...")
+    path = await download_track(url)
+    if not path:
+        await wait.edit_text("❌ Не удалось загрузить трек.")
+        return
+    audio = FSInputFile(path, filename=f"{title}.mp3")
+    await cb.message.answer_audio(
+        audio, title=title, performer=artist,
+        caption=f"🎵 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}",
+        parse_mode="HTML"
+    )
+    await wait.delete()
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+# ─── SUGGESTIONS ─────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "suggest_start")
+async def cb_suggest(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SuggestionState.waiting_text)
+    await cb.message.edit_text(
+        "💡 Напиши своё предложение — какие песни добавить или что улучшить:"
+    )
+
+@router.message(SuggestionState.waiting_text)
+async def handle_suggestion(msg: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    with db() as conn:
+        conn.execute("INSERT INTO suggestions(user_id, username, text, ts) VALUES (?,?,?,?)",
+                     (msg.from_user.id, msg.from_user.username or "",
+                      msg.text, datetime.now().isoformat()))
+        conn.commit()
+    await msg.answer("✅ Предложение отправлено, спасибо!", reply_markup=main_menu_kb())
+    # уведомление админу
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"💡 <b>Новое предложение</b>\n"
+            f"👤 @{msg.from_user.username or msg.from_user.id}\n\n"
+            f"{html.escape(msg.text)}",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+# ─── ADMIN ───────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        return
+    s = get_stats()
+    text = (
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👥 Пользователей: <b>{s.get('total_users', 0)}</b>\n"
+        f"🔍 Поисков: <b>{s.get('total_searches', 0)}</b>\n"
+        f"⬇️ Скачиваний: <b>{s.get('total_downloads', 0)}</b>\n"
+        f"📂 Плейлистов: <b>{s.get('total_playlists', 0)}</b>\n"
+        f"💡 Предложений: <b>{s.get('total_suggestions', 0)}</b>"
+    )
+    await cb.message.edit_text(text, reply_markup=admin_kb(), parse_mode="HTML")
+
+@router.callback_query(F.data == "admin_dl_stats")
+async def cb_dl_stats(cb: CallbackQuery, bot: Bot):
+    if cb.from_user.id != ADMIN_ID:
+        return
+    content = get_all_searches_txt()
+    path = "/tmp/stats_export.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"Экспорт статистики {datetime.now().isoformat()}\n\n")
+        f.write(content)
+    await bot.send_document(ADMIN_ID, FSInputFile(path, "stats.txt"),
+                            caption="📥 Статистика поисков")
+    await cb.answer()
+
+@router.callback_query(F.data == "admin_dl_logs")
+async def cb_dl_logs(cb: CallbackQuery, bot: Bot):
+    if cb.from_user.id != ADMIN_ID:
+        return
+    if os.path.exists("bot.log"):
+        await bot.send_document(ADMIN_ID, FSInputFile("bot.log", "bot.log"),
+                                caption="📋 Логи бота")
+    else:
+        await cb.answer("Логов нет", show_alert=True)
+    await cb.answer()
+
+@router.callback_query(F.data == "admin_suggestions")
+async def cb_admin_suggestions(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        return
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT username, text, ts FROM suggestions ORDER BY ts DESC LIMIT 20"
+        ).fetchall()
+    if not rows:
+        await cb.answer("Предложений нет", show_alert=True)
+        return
+    text = "💡 <b>Последние предложения:</b>\n\n"
+    for username, msg_text, ts in rows:
+        text += f"👤 @{username} [{ts[:10]}]\n{html.escape(msg_text[:200])}\n\n"
+    await cb.message.edit_text(text[:4000], reply_markup=admin_kb(), parse_mode="HTML")
+
+# ─── INLINE MODE (для групп) ──────────────────────────────────────────────────
+
+@router.inline_query()
+async def inline_search(inline: InlineQuery):
+    query = inline.query.strip()
+    if not query:
+        await inline.answer([], cache_time=1)
+        return
+    tracks = await search_tracks(query)
+    results = []
+    for i, t in enumerate(tracks[:5]):
+        token = encode_url(t["url"])
+        _url_cache[token[:60]] = t["url"]
+        results.append(
+            InlineQueryResultArticle(
+                id=str(i),
+                title=t["title"],
+                description=t["uploader"],
+                input_message_content=InputTextMessageContent(
+                    message_text=f"🎵 <b>{html.escape(t['title'])}</b>\n👤 {html.escape(t['uploader'])}\n\n"
+                                 f"Отправить: /dl_{token[:40]}",
+                    parse_mode="HTML"
+                )
+            )
+        )
+    await inline.answer(results, cache_time=30)
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
+async def main():
+    init_db()
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    logger.info("Bot started")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
