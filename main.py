@@ -136,33 +136,69 @@ def encode_url(url: str) -> str:
 def decode_url(token: str) -> str:
     return base64.urlsafe_b64decode(token.encode()).decode()
 
-def ydl_opts_search(query: str, max_results: int = 8):
-    return {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "default_search": f"ytsearch{max_results}",
-        "format": "bestaudio/best",
-    }
+# user service preference
+_user_service: Dict[int, str] = {}
 
-async def search_tracks(query: str) -> List[Dict]:
+def get_user_service(user_id: int) -> str:
+    return _user_service.get(user_id, "youtube")
+
+def set_user_service(user_id: int, service: str):
+    _user_service[user_id] = service
+
+async def search_tracks(query: str, service: str = "youtube") -> List[Dict]:
     loop = asyncio.get_event_loop()
+
     def _search():
-        with YoutubeDL(ydl_opts_search(query)) as ydl:
-            info = ydl.extract_info(query, download=False)
+        if service == "soundcloud":
+            search_query = f"scsearch8:{query}"
+        else:
+            # youtube or ytmusic both use ytsearch, ytmusic just adds music context
+            search_query = f"ytsearch8:{query}"
+
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "ignoreerrors": True,
+        }
+
+        results = []
+        with YoutubeDL(opts) as ydl:
+            try:
+                info = ydl.extract_info(search_query, download=False)
+            except Exception as ex:
+                print(f"SEARCH ERROR: {ex}", flush=True)
+                return []
+
+            if not info:
+                return []
+
             entries = info.get("entries", [])
-            results = []
             for e in entries:
                 if not e:
                     continue
+                url = e.get("webpage_url") or e.get("url", "")
+                if not url:
+                    continue
+                thumb = ""
+                thumbnails = e.get("thumbnails")
+                if thumbnails and isinstance(thumbnails, list):
+                    thumb = thumbnails[-1].get("url", "")
+                elif e.get("thumbnail"):
+                    thumb = e.get("thumbnail")
                 results.append({
                     "title": e.get("title", "Unknown"),
-                    "uploader": e.get("uploader") or e.get("channel") or "Unknown",
-                    "url": e.get("url") or e.get("webpage_url", ""),
-                    "thumb": e.get("thumbnail", ""),
+                    "uploader": e.get("uploader") or e.get("channel") or e.get("artist") or "Unknown",
+                    "url": url,
+                    "thumb": thumb,
                     "duration": e.get("duration", 0),
                 })
-            return results
+                if len(results) >= 8:
+                    break
+
+        print(f"SEARCH RESULTS: {len(results)} for '{query}' via {service}", flush=True)
+        return results
+
     return await loop.run_in_executor(None, _search)
 
 async def download_track(url: str) -> Optional[str]:
@@ -236,6 +272,22 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     kb.button(text="🔍 Начать поиск", callback_data="search_start")
     kb.button(text="📂 Плейлисты", callback_data="playlists_menu")
     kb.button(text="💡 Предложения", callback_data="suggest_start")
+    kb.button(text="⚙️ Источник музыки", callback_data="service_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def service_kb(user_id: int) -> InlineKeyboardMarkup:
+    current = get_user_service(user_id)
+    kb = InlineKeyboardBuilder()
+    services = [
+        ("youtube", "▶️ YouTube"),
+        ("soundcloud", "☁️ SoundCloud"),
+    ]
+    for key, label in services:
+        check = "✅ " if current == key else ""
+        kb.button(text=f"{check}{label}", callback_data=f"set_service:{key}")
+    kb.button(text="◀️ Назад", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -338,13 +390,15 @@ async def handle_search(msg: Message, state: FSMContext):
     await state.clear()
     log_search(msg.from_user.id, query)
     wait = await msg.answer("⏳ Ищу треки...")
-    tracks = await search_tracks(query)
+    service = get_user_service(msg.from_user.id)
+    tracks = await search_tracks(query, service)
     if not tracks:
         await wait.edit_text("❌ Ничего не нашёл. Попробуй другой запрос.",
                              reply_markup=main_menu_kb())
         return
-    # сохраняем треки во временный стор
-    tracks_data = json.dumps(tracks, ensure_ascii=False)
+    for t in tracks:
+        token = encode_url(t["url"])
+        _url_cache[token[:60]] = t["url"]
     text = f"🎵 <b>Результаты по запросу:</b> {html.escape(query)}\n\nВыбери трек:"
     await wait.edit_text(text, reply_markup=search_results_kb(tracks), parse_mode="HTML")
 
@@ -617,6 +671,33 @@ async def cb_admin_suggestions(cb: CallbackQuery):
         text += f"👤 @{username} [{ts[:10]}]\n{html.escape(msg_text[:200])}\n\n"
     await cb.message.edit_text(text[:4000], reply_markup=admin_kb(), parse_mode="HTML")
 
+
+# ─── SERVICE SELECTION ───────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "service_menu")
+async def cb_service_menu(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "⚙️ <b>Выбери источник музыки</b>\n\n"
+        "▶️ YouTube — всё подряд, максимальное покрытие\n"
+        "☁️ SoundCloud — инди, андеграунд, эксклюзивы",
+        reply_markup=service_kb(cb.from_user.id),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("set_service:"))
+async def cb_set_service(cb: CallbackQuery):
+    service = cb.data.split(":")[1]
+    set_user_service(cb.from_user.id, service)
+    names = {"youtube": "YouTube", "soundcloud": "SoundCloud"}
+    await cb.answer(f"✅ Источник: {names.get(service, service)}", show_alert=False)
+    await cb.message.edit_text(
+        "⚙️ <b>Выбери источник музыки</b>\n\n"
+        "▶️ YouTube — всё подряд, максимальное покрытие\n"
+        "☁️ SoundCloud — инди, андеграунд, эксклюзивы",
+        reply_markup=service_kb(cb.from_user.id),
+        parse_mode="HTML"
+    )
+
 # ─── INLINE MODE (для групп) ──────────────────────────────────────────────────
 
 @router.inline_query()
@@ -625,7 +706,8 @@ async def inline_search(inline: InlineQuery):
     if not query:
         await inline.answer([], cache_time=1)
         return
-    tracks = await search_tracks(query)
+    service = get_user_service(msg.from_user.id)
+    tracks = await search_tracks(query, service)
     results = []
     for i, t in enumerate(tracks[:5]):
         token = encode_url(t["url"])
