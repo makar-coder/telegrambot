@@ -251,105 +251,6 @@ async def download_track(url: str) -> Optional[str]:
         return None
     return await loop.run_in_executor(None, _dl)
 
-def _clean_lyrics(raw: str) -> str:
-    raw = re.sub(r'<br\s*/?>', '\n', raw, flags=re.IGNORECASE)
-    raw = re.sub(r'<[^>]+>', '', raw)
-    raw = html.unescape(raw)
-    raw = raw.replace('\r\n', '\n').replace('\r', '\n')
-    raw = re.sub(r'\n{3,}', '\n\n', raw)
-    return raw.strip()
-
-async def get_lyrics(title: str, artist: str) -> Optional[str]:
-    clean_title = re.sub(r'[\(\[].*?[\)\]]', '', title).strip()
-    clean_artist = re.sub(r'[\(\[].*?[\)\]]', '', artist).strip()
-    query = f"{clean_artist} {clean_title}".strip()
-    headers_browser = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    }
-
-    async def scrape_genius_url(session, url):
-        async with session.get(url, headers=headers_browser) as r2:
-            page = await r2.text()
-        containers = re.findall(r'<div[^>]*data-lyrics-container="true"[^>]*>(.*?)</div>\s*</div>', page, re.DOTALL)
-        if not containers:
-            containers = re.findall(r'<div[^>]*data-lyrics-container[^>]*>(.*?)</div>', page, re.DOTALL)
-        if containers:
-            lyr = _clean_lyrics("\n".join(containers))
-            if lyr and len(lyr) > 80:
-                return lyr[:4096]
-        return None
-
-    # Source 1: lyrics.ovh
-    try:
-        async with ClientSession(timeout=ClientTimeout(total=8)) as session:
-            sa = clean_artist.replace("/", " ")
-            st = clean_title.replace("/", " ")
-            async with session.get(f"https://api.lyrics.ovh/v1/{sa}/{st}") as r:
-                if r.status == 200:
-                    data = await r.json(content_type=None)
-                    lyr = data.get("lyrics", "").strip()
-                    if lyr and len(lyr) > 80:
-                        return lyr[:4096]
-    except Exception:
-        pass
-
-    # Source 2: Genius multi-search scrape
-    try:
-        async with ClientSession(timeout=ClientTimeout(total=12)) as session:
-            import urllib.parse
-            search_url = f"https://genius.com/api/search/multi?per_page=5&q={urllib.parse.quote(query)}"
-            async with session.get(search_url, headers=headers_browser) as r:
-                if r.status == 200:
-                    data = await r.json(content_type=None)
-                    song_url = None
-                    for section in data.get("response", {}).get("sections", []):
-                        for h in section.get("hits", []):
-                            if h.get("type") == "song":
-                                song_url = h["result"].get("url")
-                                break
-                        if song_url:
-                            break
-                    if song_url:
-                        lyr = await scrape_genius_url(session, song_url)
-                        if lyr:
-                            return lyr
-    except Exception:
-        pass
-
-    # Source 3: Genius API + scrape
-    if GENIUS_TOKEN:
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=10)) as session:
-                api_headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
-                async with session.get("https://api.genius.com/search", params={"q": query}, headers=api_headers) as r:
-                    data = await r.json(content_type=None)
-                hits = data.get("response", {}).get("hits", [])
-                if hits:
-                    lyr = await scrape_genius_url(session, hits[0]["result"]["url"])
-                    if lyr:
-                        return lyr
-        except Exception:
-            pass
-
-    # Source 4: azlyrics
-    try:
-        async with ClientSession(timeout=ClientTimeout(total=10)) as session:
-            a = re.sub(r"[^a-z0-9]", "", clean_artist.lower())
-            t = re.sub(r"[^a-z0-9]", "", clean_title.lower())
-            async with session.get(f"https://www.azlyrics.com/lyrics/{a}/{t}.html", headers=headers_browser) as r:
-                if r.status == 200:
-                    page = await r.text()
-                    m = re.search(r'<!-- Usage[^>]*-->\s*(.*?)\s*<!-- MxM[^>]*-->', page, re.DOTALL)
-                    if m:
-                        lyr = _clean_lyrics(m.group(1))
-                        if lyr and len(lyr) > 80:
-                            return lyr[:4096]
-    except Exception:
-        pass
-
-    return None
-
 
 # ─── FSM STATES ──────────────────────────────────────────────────────────────
 
@@ -415,7 +316,6 @@ def track_kb(token: str, title: str, artist: str, playlist_token: str) -> Inline
     kb = InlineKeyboardBuilder()
     _meta_cache[token] = {"title": title, "artist": artist}
     # token is short int string e.g. "1", "2" — never exceeds 64 bytes
-    kb.button(text="📝 Показать текст", callback_data=f"lyr:{token}")
     kb.button(text="➕ В плейлист", callback_data=f"apl:{token}")
     kb.button(text="🏠 Главное меню", callback_data="main_menu")
     kb.adjust(1)
@@ -677,22 +577,6 @@ async def cb_download(cb: CallbackQuery):
             pass
 
 # ─── LYRICS ──────────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("lyr:"))
-async def cb_lyrics(cb: CallbackQuery):
-    token = cb.data[4:]
-    meta = _meta_cache.get(token, {})
-    title = meta.get("title", "Unknown")
-    artist = meta.get("artist", "Unknown")
-    await cb.answer("⏳ Ищу текст...")
-    lyrics = await get_lyrics(title, artist)
-    if not lyrics:
-        await cb.message.answer("❌ Текст не найден.")
-        return
-    await cb.message.answer(
-        f"📝 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}\n\n{html.escape(lyrics)}",
-        parse_mode="HTML"
-    )
 
 # ─── PLAYLISTS ───────────────────────────────────────────────────────────────
 
