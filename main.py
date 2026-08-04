@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 # in-memory url cache (token -> full url)
 _url_cache: Dict[str, str] = {}
+_meta_cache: Dict[str, Dict] = {}  # token -> {title, artist}
 
 # ─── DATABASE ────────────────────────────────────────────────────────────────
 
@@ -143,7 +144,7 @@ def decode_url(token: str) -> str:
 _user_service: Dict[int, str] = {}
 
 def get_user_service(user_id: int) -> str:
-    return _user_service.get(user_id, "youtube")
+    return _user_service.get(user_id, "soundcloud")
 
 def set_user_service(user_id: int, service: str):
     _user_service[user_id] = service
@@ -306,8 +307,10 @@ def search_results_kb(tracks: List[Dict]) -> InlineKeyboardMarkup:
 
 def track_kb(token: str, title: str, artist: str, playlist_token: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="📝 Показать текст", callback_data=f"lyrics:{token[:60]}:{title[:20]}:{artist[:20]}")
-    kb.button(text="➕ В плейлист", callback_data=f"addpl:{token[:60]}:{title[:20]}:{artist[:20]}")
+    # store title/artist in cache keyed by token for lyrics/playlist use
+    _meta_cache[token] = {"title": title, "artist": artist}
+    kb.button(text="📝 Показать текст", callback_data=f"lyrics:{token}")
+    kb.button(text="➕ В плейлист", callback_data=f"addpl:{token}")
     kb.button(text="🏠 Главное меню", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -472,9 +475,10 @@ async def cb_download(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("lyrics:"))
 async def cb_lyrics(cb: CallbackQuery):
-    parts = cb.data.split(":")
-    title = parts[2] if len(parts) > 2 else "Unknown"
-    artist = parts[3] if len(parts) > 3 else "Unknown"
+    token = cb.data[7:]
+    meta = _meta_cache.get(token, {})
+    title = meta.get("title", "Unknown")
+    artist = meta.get("artist", "Unknown")
     await cb.answer("⏳ Ищу текст...")
     lyrics = await get_lyrics(title, artist)
     if not lyrics:
@@ -535,10 +539,10 @@ async def cb_pl_delete(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("addpl:"))
 async def cb_addpl(cb: CallbackQuery):
-    parts = cb.data.split(":")
-    token = parts[1]
-    title = parts[2] if len(parts) > 2 else "Unknown"
-    artist = parts[3] if len(parts) > 3 else "Unknown"
+    token = cb.data[6:]
+    meta = _meta_cache.get(token, {})
+    title = meta.get("title", "Unknown")
+    artist = meta.get("artist", "Unknown")
     url = _url_cache.get(token, "")
     user_id = cb.from_user.id
     with db() as conn:
@@ -549,7 +553,11 @@ async def cb_addpl(cb: CallbackQuery):
         return
     kb = InlineKeyboardBuilder()
     for pid, name in rows:
-        kb.button(text=f"📁 {name}", callback_data=f"addto:{pid}:{token}:{title}:{artist}")
+        # store token in cache with pid prefix
+        cb_data = f"addto:{pid}:{token}"
+        if len(cb_data) > 64:
+            cb_data = f"addto:{pid}:{token[:60-len(str(pid))]}"
+        kb.button(text=f"📁 {name}", callback_data=cb_data)
     kb.adjust(1)
     await cb.message.answer("В какой плейлист добавить?", reply_markup=kb.as_markup())
 
@@ -558,8 +566,9 @@ async def cb_addto(cb: CallbackQuery):
     parts = cb.data.split(":")
     pid = int(parts[1])
     token = parts[2]
-    title = parts[3] if len(parts) > 3 else "Unknown"
-    artist = parts[4] if len(parts) > 4 else "Unknown"
+    meta = _meta_cache.get(token, {})
+    title = meta.get("title", "Unknown")
+    artist = meta.get("artist", "Unknown")
     url = _url_cache.get(token, "")
     with db() as conn:
         conn.execute("INSERT INTO playlist_tracks(playlist_id, title, artist, url) VALUES (?,?,?,?)",
