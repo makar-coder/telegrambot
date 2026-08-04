@@ -659,10 +659,13 @@ async def start_web():
     await site.start()
 
 async def main():
+    print("init_db...", flush=True)
     init_db()
+    print("creating bot...", flush=True)
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    print("starting polling + web...", flush=True)
     logger.info("Bot started")
     await asyncio.gather(
         start_web(),
@@ -670,4 +673,9 @@ async def main():
     )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"FATAL ERROR: {e}", flush=True)
+        sys.exit(1)
