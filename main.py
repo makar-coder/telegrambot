@@ -88,6 +88,23 @@ def init_db():
             key TEXT PRIMARY KEY,
             value INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            first_name TEXT,
+            title TEXT,
+            artist TEXT,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS track_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            artist TEXT,
+            url TEXT,
+            count INTEGER DEFAULT 1,
+            UNIQUE(url)
+        );
     """)
     # init stats keys
     for key in ("total_users", "total_searches", "total_downloads"):
@@ -127,11 +144,46 @@ def get_stats() -> dict:
 def get_all_searches_txt() -> str:
     with db() as conn:
         rows = conn.execute(
-            "SELECT u.first_name, s.query, s.ts FROM searches s "
+            "SELECT u.first_name, u.username, s.query, s.ts FROM searches s "
             "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.ts DESC LIMIT 1000"
         ).fetchall()
-    lines = [f"{ts} | {name or 'unknown'} | {q}" for name, q, ts in rows]
+    lines = [f"{ts} | @{un or '?'} {nm or '?'} | {q}" for nm, un, q, ts in rows]
     return "\n".join(lines)
+
+def log_download(user_id: int, username: str, first_name: str, title: str, artist: str, url: str):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO history(user_id, username, first_name, title, artist, ts) VALUES (?,?,?,?,?,?)",
+            (user_id, username, first_name, title, artist, datetime.now().isoformat())
+        )
+        conn.execute(
+            "INSERT INTO track_stats(title, artist, url, count) VALUES (?,?,?,1) "
+            "ON CONFLICT(url) DO UPDATE SET count=count+1",
+            (title, artist, url)
+        )
+        conn.commit()
+
+def get_download_log_txt() -> str:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT ts, first_name, username, title, artist FROM history ORDER BY ts DESC LIMIT 500"
+        ).fetchall()
+    lines = [f"{ts} | @{un or '?'} {nm or '?'} | {title} — {artist}"
+             for ts, nm, un, title, artist in rows]
+    return "\n".join(lines)
+
+def get_top_tracks(limit: int = 10) -> list:
+    with db() as conn:
+        return conn.execute(
+            "SELECT title, artist, count FROM track_stats ORDER BY count DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+def get_user_history(user_id: int, limit: int = 20) -> list:
+    with db() as conn:
+        return conn.execute(
+            "SELECT title, artist, ts FROM history WHERE user_id=? ORDER BY ts DESC LIMIT ?",
+            (user_id, limit)
+        ).fetchall()
 
 # ─── YT-DLP SEARCH & DOWNLOAD ────────────────────────────────────────────────
 
@@ -255,6 +307,29 @@ async def download_track(url: str) -> Optional[str]:
     return await loop.run_in_executor(None, _dl)
 
 
+
+async def fetch_thumb_url(title: str, artist: str) -> str:
+    """Get artwork from iTunes API — free, no key, works for 99% of tracks."""
+    import urllib.parse
+    query = urllib.parse.quote(f"{artist} {title}")
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=6)) as session:
+            async with session.get(
+                f"https://itunes.apple.com/search?term={query}&media=music&limit=1",
+                headers={"User-Agent": "Mozilla/5.0"}
+            ) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    results = data.get("results", [])
+                    if results:
+                        # artworkUrl100 -> replace 100x100 with 600x600
+                        art = results[0].get("artworkUrl100", "")
+                        if art:
+                            return art.replace("100x100bb", "600x600bb")
+    except Exception:
+        pass
+    return ""
+
 # ─── FSM STATES ──────────────────────────────────────────────────────────────
 
 class SearchState(StatesGroup):
@@ -351,9 +426,12 @@ def playlist_tracks_kb(pid: int) -> InlineKeyboardMarkup:
 def admin_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Статистика", callback_data="admin_stats")
-    kb.button(text="📥 Скачать статистику TXT", callback_data="admin_dl_stats")
-    kb.button(text="📋 Скачать логи", callback_data="admin_dl_logs")
-    kb.button(text="💌 Предложения пользователей", callback_data="admin_suggestions")
+    kb.button(text="🎵 Лог скачиваний", callback_data="admin_dl_music_log")
+    kb.button(text="📥 Скачать поиски TXT", callback_data="admin_dl_stats")
+    kb.button(text="📥 Скачать лог музыки TXT", callback_data="admin_dl_music_txt")
+    kb.button(text="📋 Скачать системные логи", callback_data="admin_dl_logs")
+    kb.button(text="🏆 Топ треков", callback_data="admin_top_tracks")
+    kb.button(text="💌 Предложения", callback_data="admin_suggestions")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -532,39 +610,21 @@ async def cb_download(cb: CallbackQuery):
         await wait.edit_text("❌ Не удалось загрузить трек. Попробуй другой.")
         return
 
-    # get meta from cache first (faster, no extra request)
+    # get meta from cache
     cached_meta = _meta_cache.get(token, {})
     title = cached_meta.get("title", "Unknown")
     artist = cached_meta.get("artist", "Unknown")
     thumb = cached_meta.get("thumb", "")
 
-    # if no thumb in cache, fetch via yt-dlp
-    if not thumb:
-        loop = asyncio.get_event_loop()
-        def get_meta():
-            try:
-                with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    t_list = info.get("thumbnails") or []
-                    th = ""
-                    if t_list:
-                        # pick highest resolution
-                        best = max(t_list, key=lambda x: (x.get("width") or 0) * (x.get("height") or 0), default=t_list[-1])
-                        th = best.get("url", "")
-                    elif info.get("thumbnail"):
-                        th = info["thumbnail"]
-                    return (
-                        info.get("title") or title,
-                        info.get("uploader") or info.get("channel") or info.get("artist") or artist,
-                        th
-                    )
-            except Exception:
-                return title, artist, ""
-        title, artist, thumb = await loop.run_in_executor(None, get_meta)
+    # always fetch high-quality thumb from iTunes (free, no key, 99% coverage)
+    itunes_thumb = await fetch_thumb_url(title, artist)
+    if itunes_thumb:
+        thumb = itunes_thumb
 
     with db() as conn:
         conn.execute("UPDATE stats SET value=value+1 WHERE key='total_downloads'")
         conn.commit()
+    log_download(cb.from_user.id, cb.from_user.username or "", cb.from_user.first_name or "", title, artist, url)
 
     audio = FSInputFile(path, filename=f"{title}.mp3")
     try:
@@ -689,11 +749,13 @@ async def cb_pl_play(cb: CallbackQuery):
     if not path:
         await wait.edit_text("❌ Не удалось загрузить трек.")
         return
+    pl_thumb = await fetch_thumb_url(title, artist)
     audio = FSInputFile(path, filename=f"{title}.mp3")
     await cb.message.answer_audio(
-        audio, title=title, performer=artist,
+        audio, title=title[:64], performer=artist[:64],
         caption=f"🎵 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        thumbnail=URLInputFile(pl_thumb, headers={"User-Agent": "Mozilla/5.0"}) if pl_thumb else None,
     )
     await wait.delete()
     try:
@@ -812,6 +874,167 @@ async def cb_set_service(cb: CallbackQuery):
         "▶️ YouTube — всё подряд, максимальное покрытие\n"
         "☁️ SoundCloud — инди, андеграунд, эксклюзивы",
         reply_markup=service_kb(cb.from_user.id),
+        parse_mode="HTML"
+    )
+
+
+# ─── ADMIN EXTRA ──────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin_dl_music_log")
+async def cb_admin_music_log(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        return
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT ts, first_name, username, title, artist FROM history ORDER BY ts DESC LIMIT 30"
+        ).fetchall()
+    if not rows:
+        await cb.answer("Лог пуст", show_alert=True)
+        return
+    text = "🎵 <b>Последние скачивания:</b>\n\n"
+    for ts, nm, un, title, artist in rows:
+        t = ts[:16].replace("T", " ")
+        text += f"<code>{t}</code> | @{un or '?'} <b>{nm or '?'}</b>\n🎵 {html.escape(title)} — {html.escape(artist)}\n\n"
+    await cb.message.edit_text(text[:4000], reply_markup=admin_kb(), parse_mode="HTML")
+
+@router.callback_query(F.data == "admin_dl_music_txt")
+async def cb_admin_music_txt(cb: CallbackQuery, bot: Bot):
+    if cb.from_user.id != ADMIN_ID:
+        return
+    content = get_download_log_txt()
+    path = "/tmp/music_log.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"Лог скачиваний {datetime.now().isoformat()}\n\n{content}")
+    await bot.send_document(ADMIN_ID, FSInputFile(path, "music_log.txt"),
+                            caption="📥 Лог скачиваний музыки")
+    await cb.answer()
+
+@router.callback_query(F.data == "admin_top_tracks")
+async def cb_admin_top(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        return
+    tracks = get_top_tracks(15)
+    if not tracks:
+        await cb.answer("Данных нет", show_alert=True)
+        return
+    text = "🏆 <b>Топ треков бота:</b>\n\n"
+    for i, (title, artist, count) in enumerate(tracks, 1):
+        text += f"{i}. {html.escape(title)} — {html.escape(artist)} <b>×{count}</b>\n"
+    await cb.message.edit_text(text, reply_markup=admin_kb(), parse_mode="HTML")
+
+# ─── USER HISTORY ─────────────────────────────────────────────────────────────
+
+@router.message(Command("history"))
+async def cmd_history(msg: Message):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    rows = get_user_history(msg.from_user.id, 20)
+    if not rows:
+        await msg.answer("📭 История пуста — скачай первый трек!")
+        return
+    text = "🕓 <b>Твои последние треки:</b>\n\n"
+    kb = InlineKeyboardBuilder()
+    # store urls for re-download - need to look up by title+artist
+    for i, (title, artist, ts) in enumerate(rows):
+        t = ts[:16].replace("T", " ")
+        text += f"<code>{t}</code> 🎵 {html.escape(title)} — {html.escape(artist)}\n"
+    await msg.answer(text, parse_mode="HTML")
+
+# ─── TOP TRACKS ───────────────────────────────────────────────────────────────
+
+@router.message(Command("top"))
+async def cmd_top(msg: Message):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    tracks = get_top_tracks(10)
+    if not tracks:
+        await msg.answer("📭 Пока нет данных — скачай первый трек!")
+        return
+    text = "🏆 <b>Топ-10 треков бота:</b>\n\n"
+    medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    for i, (title, artist, count) in enumerate(tracks):
+        text += f"{medals[i]} {html.escape(title)} — {html.escape(artist)} <b>×{count}</b>\n"
+    await msg.answer(text, parse_mode="HTML")
+
+# ─── GENRE SEARCH ─────────────────────────────────────────────────────────────
+
+GENRE_QUERIES = {
+    "rap": "rap хип хоп",
+    "хип-хоп": "хип-хоп rap",
+    "pop": "pop hits",
+    "rock": "rock",
+    "rnb": "r&b soul",
+    "phonk": "phonk",
+    "drill": "drill",
+    "trap": "trap",
+    "edm": "edm electronic",
+    "reggaeton": "reggaeton",
+}
+
+@router.message(Command("genre"))
+async def cmd_genre(msg: Message, state: FSMContext):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    args = msg.text.split(maxsplit=1)
+    if len(args) < 2:
+        genres = ", ".join(GENRE_QUERIES.keys())
+        await msg.answer(f"🎸 Укажи жанр: /genre rap\n\nДоступные: {genres}")
+        return
+    genre = args[1].lower().strip()
+    query = GENRE_QUERIES.get(genre, genre)
+    wait = await msg.answer(f"🎸 Ищу треки жанра <b>{html.escape(genre)}</b>...", parse_mode="HTML")
+    service = get_user_service(msg.from_user.id)
+    tracks = await search_tracks(query + " популярное", service)
+    if not tracks:
+        await wait.edit_text("❌ Ничего не нашёл по этому жанру.")
+        return
+    for t in tracks:
+        token = store_url(t["url"])
+        _url_cache[token] = t["url"]
+        _meta_cache[token] = {"title": t["title"], "artist": t["uploader"], "thumb": t.get("thumb","")}
+    text = f"🎸 <b>Треки жанра {html.escape(genre)}:</b>\n\nВыбери трек:"
+    await wait.edit_text(text, reply_markup=search_results_kb(tracks), parse_mode="HTML")
+
+
+@router.message(Command("search"))
+async def cmd_search(msg: Message, state: FSMContext):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    await state.set_state(SearchState.waiting_query)
+    await msg.answer("🔍 Введи название песни или исполнителя:")
+
+@router.message(Command("playlists"))
+async def cmd_playlists(msg: Message):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    await msg.answer("📂 <b>Твои плейлисты</b>", reply_markup=playlists_kb(msg.from_user.id), parse_mode="HTML")
+
+@router.message(Command("service"))
+async def cmd_service(msg: Message):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    await msg.answer(
+        "⚙️ <b>Выбери источник музыки</b>\n\n"
+        "▶️ YouTube — максимальное покрытие\n"
+        "☁️ SoundCloud — инди, андеграунд, эксклюзивы",
+        reply_markup=service_kb(msg.from_user.id), parse_mode="HTML"
+    )
+
+@router.message(Command("suggest"))
+async def cmd_suggest(msg: Message, state: FSMContext):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    await state.set_state(SuggestionState.waiting_text)
+    await msg.answer("💡 Напиши своё предложение — какие песни добавить или что улучшить:")
+
+@router.message(Command("help"))
+async def cmd_help(msg: Message):
+    register_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    await msg.answer(
+        "❓ <b>Как пользоваться ботом</b>\n\n"
+        "🔍 <b>Поиск:</b> нажми «Начать поиск» или /search и напиши название трека или исполнителя\n\n"
+        "🎵 <b>Скачать:</b> выбери трек из списка — бот скинет mp3 с обложкой прямо в чат\n\n"
+        "📂 <b>Плейлисты:</b> создавай свои сборники через /playlists, добавляй треки кнопкой ➕\n\n"
+        "🕓 <b>История:</b> /history — последние 20 треков которые ты слушал\n\n"
+        "🏆 <b>Топ:</b> /top — самые популярные треки среди всех пользователей бота\n\n"
+        "🎸 <b>По жанру:</b> /genre rap — треки конкретного жанра\n"
+        "Жанры: rap, хип-хоп, pop, rock, rnb, phonk, drill, trap, edm, reggaeton\n\n"
+        "⚙️ <b>Источник:</b> /service — выбери откуда качать (YouTube / SoundCloud)\n\n"
+        "📲 <b>В группах:</b> пиши @юзербота и название трека — бот найдёт и скинет ссылку для скачивания\n\n"
+        "💡 <b>Предложения:</b> /suggest — напиши что хочешь видеть в боте",
         parse_mode="HTML"
     )
 
