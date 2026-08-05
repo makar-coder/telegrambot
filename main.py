@@ -205,11 +205,14 @@ async def search_tracks(query: str, service: str = "youtube") -> List[Dict]:
                 if not url:
                     continue
                 thumb = ""
-                thumbnails = e.get("thumbnails")
-                if thumbnails and isinstance(thumbnails, list):
-                    thumb = thumbnails[-1].get("url", "")
+                # SoundCloud: artwork_url, thumbnail
+                # YouTube: thumbnail field in extract_flat
+                if e.get("artwork_url"):
+                    thumb = e["artwork_url"].replace("-large", "-t500x500")
                 elif e.get("thumbnail"):
-                    thumb = e.get("thumbnail")
+                    thumb = e.get("thumbnail", "")
+                elif e.get("thumbnails") and isinstance(e.get("thumbnails"), list):
+                    thumb = e["thumbnails"][-1].get("url", "")
                 results.append({
                     "title": e.get("title", "Unknown"),
                     "uploader": e.get("uploader") or e.get("channel") or e.get("artist") or "Unknown",
@@ -297,7 +300,7 @@ def search_results_kb(tracks: List[Dict], page: int = 0) -> InlineKeyboardMarkup
     for t in page_tracks:
         token = store_url(t["url"])
         _url_cache[token] = t["url"]
-        _meta_cache[token] = {"title": t["title"], "artist": t["uploader"]}
+        _meta_cache[token] = {"title": t["title"], "artist": t["uploader"], "thumb": t.get("thumb", "")}
         label = f"🎵 {t['title'][:30]} — {t['uploader'][:15]}"
         kb.button(text=label, callback_data=f"dl:{token}")
     # pagination
@@ -529,27 +532,35 @@ async def cb_download(cb: CallbackQuery):
         await wait.edit_text("❌ Не удалось загрузить трек. Попробуй другой.")
         return
 
-    loop = asyncio.get_event_loop()
-    def get_meta():
-        try:
-            with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                thumb = ""
-                thumbnails = info.get("thumbnails") or []
-                if thumbnails:
-                    # get highest quality
-                    thumb = thumbnails[-1].get("url", "")
-                elif info.get("thumbnail"):
-                    thumb = info.get("thumbnail", "")
-                return (
-                    info.get("title", "Unknown"),
-                    info.get("uploader") or info.get("channel") or info.get("artist") or "Unknown",
-                    thumb
-                )
-        except Exception:
-            return "Unknown", "Unknown", ""
+    # get meta from cache first (faster, no extra request)
+    cached_meta = _meta_cache.get(token, {})
+    title = cached_meta.get("title", "Unknown")
+    artist = cached_meta.get("artist", "Unknown")
+    thumb = cached_meta.get("thumb", "")
 
-    title, artist, thumb = await loop.run_in_executor(None, get_meta)
+    # if no thumb in cache, fetch via yt-dlp
+    if not thumb:
+        loop = asyncio.get_event_loop()
+        def get_meta():
+            try:
+                with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    t_list = info.get("thumbnails") or []
+                    th = ""
+                    if t_list:
+                        # pick highest resolution
+                        best = max(t_list, key=lambda x: (x.get("width") or 0) * (x.get("height") or 0), default=t_list[-1])
+                        th = best.get("url", "")
+                    elif info.get("thumbnail"):
+                        th = info["thumbnail"]
+                    return (
+                        info.get("title") or title,
+                        info.get("uploader") or info.get("channel") or info.get("artist") or artist,
+                        th
+                    )
+            except Exception:
+                return title, artist, ""
+        title, artist, thumb = await loop.run_in_executor(None, get_meta)
 
     with db() as conn:
         conn.execute("UPDATE stats SET value=value+1 WHERE key='total_downloads'")
@@ -563,7 +574,7 @@ async def cb_download(cb: CallbackQuery):
             performer=artist[:64],
             caption=f"🎵 <b>{html.escape(title)}</b>\n👤 {html.escape(artist)}",
             parse_mode="HTML",
-            thumbnail=URLInputFile(thumb) if thumb else None,
+            thumbnail=URLInputFile(thumb, headers={"User-Agent": "Mozilla/5.0"}) if thumb else None,
             reply_markup=track_kb(token, title, artist, token)
         )
         await wait.delete()
@@ -823,7 +834,7 @@ async def inline_search(inline: InlineQuery):
     for i, t in enumerate(tracks[:20]):
         token = store_url(t["url"])
         _url_cache[token] = t["url"]
-        _meta_cache[token] = {"title": t["title"], "artist": t["uploader"]}
+        _meta_cache[token] = {"title": t["title"], "artist": t["uploader"], "thumb": t.get("thumb", "")}
         results.append(
             InlineQueryResultArticle(
                 id=str(i),
