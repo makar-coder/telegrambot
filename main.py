@@ -7,6 +7,12 @@ import re
 import time
 import base64
 import sqlite3
+try:
+    import psycopg2
+    import psycopg2.extras
+    POSTGRES = bool(os.getenv("DATABASE_URL"))
+except ImportError:
+    POSTGRES = False
 from dataclasses import dataclass, field
 from itertools import count
 from typing import Any, Dict, List, Optional
@@ -34,6 +40,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 GENIUS_TOKEN = os.getenv("GENIUS_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")  # Supabase PostgreSQL
 
 print(f"TOKEN: {str(BOT_TOKEN)[:10]}... ADMIN: {ADMIN_ID}", flush=True)
 
@@ -47,10 +54,62 @@ _meta_cache: Dict[str, Dict] = {}  # token -> {title, artist}
 
 # ─── DATABASE ────────────────────────────────────────────────────────────────
 
+def get_pg_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def db():
+    """Return SQLite connection (local fallback)."""
+    return sqlite3.connect("music.db")
+
+def pg_execute(sql: str, params=None, fetch=False):
+    """Execute on PostgreSQL."""
+    conn = get_pg_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params or [])
+    result = cur.fetchall() if fetch else None
+    conn.commit()
+    conn.close()
+    return result
+
+
+def dbq(sql: str, params=None, fetch=False, many=False):
+    """Universal DB query — auto routes to Postgres or SQLite."""
+    if POSTGRES:
+        sql_pg = sql.replace("?", "%s").replace("INSERT OR IGNORE", "INSERT").replace(
+            "ON CONFLICT DO NOTHING", "ON CONFLICT DO NOTHING")
+        return pg_execute(sql_pg, params, fetch)
+    else:
+        with sqlite3.connect("music.db") as conn:
+            cur = conn.execute(sql, params or [])
+            if fetch:
+                return cur.fetchall()
+            conn.commit()
+            return None
+
+def dbq1(sql: str, params=None):
+    """Fetch single row."""
+    res = dbq(sql, params, fetch=True)
+    return res[0] if res else None
+
+def db_execute(sql_pg: str, sql_sqlite: str, params=None, fetch=False):
+    """Auto-route to Postgres or SQLite."""
+    if POSTGRES:
+        sql = sql_pg
+        try:
+            return pg_execute(sql, params, fetch)
+        except Exception as e:
+            print(f"PG ERROR: {e}", flush=True)
+            raise
+    else:
+        with sqlite3.connect("music.db") as conn:
+            cur = conn.execute(sql_sqlite, params or [])
+            if fetch:
+                return cur.fetchall()
+            conn.commit()
+            return None
+
 def init_db():
-    conn = sqlite3.connect("music.db")
-    c = conn.cursor()
-    c.executescript("""
+    schema_sqlite = """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             username TEXT,
@@ -105,85 +164,191 @@ def init_db():
             count INTEGER DEFAULT 1,
             UNIQUE(url)
         );
-    """)
-    # init stats keys
-    for key in ("total_users", "total_searches", "total_downloads"):
-        c.execute("INSERT OR IGNORE INTO stats(key, value) VALUES (?, 0)", (key,))
-    conn.commit()
-    conn.close()
+    """
+    schema_pg = """
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            joined_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS searches (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            query TEXT,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS playlists (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            name TEXT,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS playlist_tracks (
+            id SERIAL PRIMARY KEY,
+            playlist_id INTEGER,
+            title TEXT,
+            artist TEXT,
+            url TEXT,
+            thumb TEXT
+        );
+        CREATE TABLE IF NOT EXISTS suggestions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            username TEXT,
+            text TEXT,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS stats (
+            key TEXT PRIMARY KEY,
+            value INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS history (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            username TEXT,
+            first_name TEXT,
+            title TEXT,
+            artist TEXT,
+            ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS track_stats (
+            id SERIAL PRIMARY KEY,
+            title TEXT,
+            artist TEXT,
+            url TEXT UNIQUE,
+            count INTEGER DEFAULT 1
+        );
+    """
+    if POSTGRES:
+        conn = get_pg_conn()
+        cur = conn.cursor()
+        for stmt in [s.strip() for s in schema_pg.split(";") if s.strip()]:
+            try:
+                cur.execute(stmt)
+            except Exception:
+                conn.rollback()
+        for key in ("total_users", "total_searches", "total_downloads"):
+            cur.execute("INSERT INTO stats(key,value) VALUES(%s,0) ON CONFLICT(key) DO NOTHING", (key,))
+        conn.commit()
+        conn.close()
+        print("PostgreSQL initialized", flush=True)
+    else:
+        conn = sqlite3.connect("music.db")
+        c = conn.cursor()
+        c.executescript(schema_sqlite)
+        for key in ("total_users", "total_searches", "total_downloads"):
+            c.execute("INSERT OR IGNORE INTO stats(key, value) VALUES (?, 0)", (key,))
+        conn.commit()
+        conn.close()
+        print("SQLite initialized", flush=True)
 
-def db():
-    return sqlite3.connect("music.db")
+
 
 def register_user(user_id, username, first_name):
-    with db() as conn:
-        c = conn.cursor()
-        existing = c.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+    if POSTGRES:
+        existing = pg_execute("SELECT id FROM users WHERE id=%s", (user_id,), fetch=True)
         if not existing:
-            c.execute("INSERT INTO users VALUES (?,?,?,?)",
-                      (user_id, username, first_name, datetime.now().isoformat()))
-            c.execute("UPDATE stats SET value=value+1 WHERE key='total_users'")
-            conn.commit()
+            pg_execute("INSERT INTO users VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                       (user_id, username, first_name, datetime.now().isoformat()))
+            pg_execute("UPDATE stats SET value=value+1 WHERE key='total_users'")
+    else:
+        with sqlite3.connect("music.db") as conn:
+            c = conn.cursor()
+            existing = c.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+            if not existing:
+                c.execute("INSERT INTO users VALUES (?,?,?,?)",
+                          (user_id, username, first_name, datetime.now().isoformat()))
+                c.execute("UPDATE stats SET value=value+1 WHERE key='total_users'")
+                conn.commit()
 
 def log_search(user_id, query):
-    with db() as conn:
-        conn.execute("INSERT INTO searches(user_id, query, ts) VALUES (?,?,?)",
-                     (user_id, query, datetime.now().isoformat()))
-        conn.execute("UPDATE stats SET value=value+1 WHERE key='total_searches'")
-        conn.commit()
+    ts = datetime.now().isoformat()
+    if POSTGRES:
+        pg_execute("INSERT INTO searches(user_id,query,ts) VALUES(%s,%s,%s)", (user_id, query, ts))
+        pg_execute("UPDATE stats SET value=value+1 WHERE key='total_searches'")
+    else:
+        with sqlite3.connect("music.db") as conn:
+            conn.execute("INSERT INTO searches(user_id, query, ts) VALUES (?,?,?)", (user_id, query, ts))
+            conn.execute("UPDATE stats SET value=value+1 WHERE key='total_searches'")
+            conn.commit()
 
 def get_stats() -> dict:
-    with db() as conn:
-        c = conn.cursor()
-        rows = c.execute("SELECT key, value FROM stats").fetchall()
+    if POSTGRES:
+        rows = pg_execute("SELECT key, value FROM stats", fetch=True) or []
         stats = dict(rows)
-        stats["total_playlists"] = c.execute("SELECT COUNT(*) FROM playlists").fetchone()[0]
-        stats["total_suggestions"] = c.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0]
+        pl = pg_execute("SELECT COUNT(*) FROM playlists", fetch=True)
+        stats["total_playlists"] = pl[0][0] if pl else 0
+        sg = pg_execute("SELECT COUNT(*) FROM suggestions", fetch=True)
+        stats["total_suggestions"] = sg[0][0] if sg else 0
         return stats
+    else:
+        with sqlite3.connect("music.db") as conn:
+            c = conn.cursor()
+            rows = c.execute("SELECT key, value FROM stats").fetchall()
+            stats = dict(rows)
+            stats["total_playlists"] = c.execute("SELECT COUNT(*) FROM playlists").fetchone()[0]
+            stats["total_suggestions"] = c.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0]
+            return stats
 
 def get_all_searches_txt() -> str:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT u.first_name, u.username, s.query, s.ts FROM searches s "
-            "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.ts DESC LIMIT 1000"
-        ).fetchall()
+    sql = ("SELECT u.first_name, u.username, s.query, s.ts FROM searches s "
+           "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.ts DESC LIMIT 1000")
+    if POSTGRES:
+        rows = pg_execute(sql.replace("?", "%s"), fetch=True) or []
+    else:
+        with sqlite3.connect("music.db") as conn:
+            rows = conn.execute(sql).fetchall()
     lines = [f"{ts} | @{un or '?'} {nm or '?'} | {q}" for nm, un, q, ts in rows]
     return "\n".join(lines)
 
 def log_download(user_id: int, username: str, first_name: str, title: str, artist: str, url: str):
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO history(user_id, username, first_name, title, artist, ts) VALUES (?,?,?,?,?,?)",
-            (user_id, username, first_name, title, artist, datetime.now().isoformat())
-        )
-        conn.execute(
-            "INSERT INTO track_stats(title, artist, url, count) VALUES (?,?,?,1) "
-            "ON CONFLICT(url) DO UPDATE SET count=count+1",
-            (title, artist, url)
-        )
-        conn.commit()
+    ts = datetime.now().isoformat()
+    if POSTGRES:
+        pg_execute("INSERT INTO history(user_id,username,first_name,title,artist,ts) VALUES(%s,%s,%s,%s,%s,%s)",
+                   (user_id, username, first_name, title, artist, ts))
+        pg_execute("INSERT INTO track_stats(title,artist,url,count) VALUES(%s,%s,%s,1) "
+                   "ON CONFLICT(url) DO UPDATE SET count=track_stats.count+1",
+                   (title, artist, url))
+    else:
+        with sqlite3.connect("music.db") as conn:
+            conn.execute("INSERT INTO history(user_id,username,first_name,title,artist,ts) VALUES(?,?,?,?,?,?)",
+                         (user_id, username, first_name, title, artist, ts))
+            conn.execute("INSERT INTO track_stats(title,artist,url,count) VALUES(?,?,?,1) "
+                         "ON CONFLICT(url) DO UPDATE SET count=count+1", (title, artist, url))
+            conn.commit()
 
 def get_download_log_txt() -> str:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT ts, first_name, username, title, artist FROM history ORDER BY ts DESC LIMIT 500"
-        ).fetchall()
+    sql = "SELECT ts, first_name, username, title, artist FROM history ORDER BY ts DESC LIMIT 500"
+    if POSTGRES:
+        rows = pg_execute(sql, fetch=True) or []
+    else:
+        with sqlite3.connect("music.db") as conn:
+            rows = conn.execute(sql).fetchall()
     lines = [f"{ts} | @{un or '?'} {nm or '?'} | {title} — {artist}"
              for ts, nm, un, title, artist in rows]
     return "\n".join(lines)
 
 def get_top_tracks(limit: int = 10) -> list:
-    with db() as conn:
-        return conn.execute(
-            "SELECT title, artist, count FROM track_stats ORDER BY count DESC LIMIT ?", (limit,)
-        ).fetchall()
+    if POSTGRES:
+        return pg_execute("SELECT title, artist, count FROM track_stats ORDER BY count DESC LIMIT %s",
+                          (limit,), fetch=True) or []
+    else:
+        with sqlite3.connect("music.db") as conn:
+            return conn.execute(
+                "SELECT title, artist, count FROM track_stats ORDER BY count DESC LIMIT ?", (limit,)
+            ).fetchall()
 
 def get_user_history(user_id: int, limit: int = 20) -> list:
-    with db() as conn:
-        return conn.execute(
-            "SELECT title, artist, ts FROM history WHERE user_id=? ORDER BY ts DESC LIMIT ?",
-            (user_id, limit)
-        ).fetchall()
+    if POSTGRES:
+        return pg_execute("SELECT title, artist, ts FROM history WHERE user_id=%s ORDER BY ts DESC LIMIT %s",
+                          (user_id, limit), fetch=True) or []
+    else:
+        with sqlite3.connect("music.db") as conn:
+            return conn.execute(
+                "SELECT title, artist, ts FROM history WHERE user_id=? ORDER BY ts DESC LIMIT ?",
+                (user_id, limit)
+            ).fetchall()
 
 # ─── YT-DLP SEARCH & DOWNLOAD ────────────────────────────────────────────────
 
@@ -401,9 +566,7 @@ def track_kb(token: str, title: str, artist: str, playlist_token: str) -> Inline
 
 def playlists_kb(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    with db() as conn:
-        rows = conn.execute("SELECT id, name FROM playlists WHERE user_id=?",
-                            (user_id,)).fetchall()
+    rows = dbq("SELECT id, name FROM playlists WHERE user_id=?", (user_id,), fetch=True) or []
     for pid, name in rows:
         kb.button(text=f"📁 {name}", callback_data=f"pl_open:{pid}")
     kb.button(text="➕ Создать плейлист", callback_data="pl_create")
@@ -413,9 +576,7 @@ def playlists_kb(user_id: int) -> InlineKeyboardMarkup:
 
 def playlist_tracks_kb(pid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    with db() as conn:
-        rows = conn.execute("SELECT id, title FROM playlist_tracks WHERE playlist_id=?",
-                            (pid,)).fetchall()
+    rows = dbq("SELECT id, title FROM playlist_tracks WHERE playlist_id=?", (pid,), fetch=True) or []
     for tid, title in rows:
         kb.button(text=f"🎵 {title[:35]}", callback_data=f"pl_play:{tid}")
     kb.button(text="🗑 Удалить плейлист", callback_data=f"pl_delete:{pid}")
@@ -621,9 +782,7 @@ async def cb_download(cb: CallbackQuery):
     if itunes_thumb:
         thumb = itunes_thumb
 
-    with db() as conn:
-        conn.execute("UPDATE stats SET value=value+1 WHERE key='total_downloads'")
-        conn.commit()
+    dbq("UPDATE stats SET value=value+1 WHERE key=?", ("total_downloads",))
     log_download(cb.from_user.id, cb.from_user.username or "", cb.from_user.first_name or "", title, artist, url)
 
     audio = FSInputFile(path, filename=f"{title}.mp3")
@@ -667,18 +826,15 @@ async def cb_pl_create(cb: CallbackQuery, state: FSMContext):
 @router.message(PlaylistState.waiting_name)
 async def handle_pl_name(msg: Message, state: FSMContext):
     await state.clear()
-    with db() as conn:
-        conn.execute("INSERT INTO playlists(user_id, name, created_at) VALUES (?,?,?)",
-                     (msg.from_user.id, msg.text.strip(), datetime.now().isoformat()))
-        conn.commit()
+    dbq("INSERT INTO playlists(user_id, name, created_at) VALUES (?,?,?)",
+        (msg.from_user.id, msg.text.strip(), datetime.now().isoformat()))
     await msg.answer(f"✅ Плейлист <b>{html.escape(msg.text.strip())}</b> создан!",
                      reply_markup=playlists_kb(msg.from_user.id), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("pl_open:"))
 async def cb_pl_open(cb: CallbackQuery):
     pid = int(cb.data.split(":")[1])
-    with db() as conn:
-        name = conn.execute("SELECT name FROM playlists WHERE id=?", (pid,)).fetchone()
+    name = dbq1("SELECT name FROM playlists WHERE id=?", (pid,))
     if not name:
         await cb.answer("Плейлист не найден")
         return
@@ -691,10 +847,8 @@ async def cb_pl_open(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("pl_delete:"))
 async def cb_pl_delete(cb: CallbackQuery):
     pid = int(cb.data.split(":")[1])
-    with db() as conn:
-        conn.execute("DELETE FROM playlists WHERE id=?", (pid,))
-        conn.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (pid,))
-        conn.commit()
+    dbq("DELETE FROM playlists WHERE id=?", (pid,))
+    dbq("DELETE FROM playlist_tracks WHERE playlist_id=?", (pid,))
     await cb.message.edit_text("🗑 Плейлист удалён.", reply_markup=playlists_kb(cb.from_user.id))
 
 @router.callback_query(F.data.startswith("apl:"))
@@ -705,9 +859,7 @@ async def cb_addpl(cb: CallbackQuery):
     artist = meta.get("artist", "Unknown")
     url = _url_cache.get(token, "")
     user_id = cb.from_user.id
-    with db() as conn:
-        rows = conn.execute("SELECT id, name FROM playlists WHERE user_id=?",
-                            (user_id,)).fetchall()
+    rows = dbq("SELECT id, name FROM playlists WHERE user_id=?", (user_id,), fetch=True) or []
     if not rows:
         await cb.answer("У тебя нет плейлистов. Создай сначала!", show_alert=True)
         return
@@ -727,18 +879,14 @@ async def cb_addto(cb: CallbackQuery):
     title = meta.get("title", "Unknown")
     artist = meta.get("artist", "Unknown")
     url = get_url(token) or _url_cache.get(token, "")
-    with db() as conn:
-        conn.execute("INSERT INTO playlist_tracks(playlist_id, title, artist, url) VALUES (?,?,?,?)",
-                     (pid, title, artist, url))
-        conn.commit()
+    dbq("INSERT INTO playlist_tracks(playlist_id, title, artist, url) VALUES (?,?,?,?)",
+        (pid, title, artist, url))
     await cb.answer("✅ Добавлено в плейлист!", show_alert=True)
 
 @router.callback_query(F.data.startswith("pl_play:"))
 async def cb_pl_play(cb: CallbackQuery):
     tid = int(cb.data.split(":")[1])
-    with db() as conn:
-        row = conn.execute("SELECT title, artist, url FROM playlist_tracks WHERE id=?",
-                           (tid,)).fetchone()
+    row = dbq1("SELECT title, artist, url FROM playlist_tracks WHERE id=?", (tid,))
     if not row:
         await cb.answer("Трек не найден")
         return
@@ -775,11 +923,8 @@ async def cb_suggest(cb: CallbackQuery, state: FSMContext):
 @router.message(SuggestionState.waiting_text)
 async def handle_suggestion(msg: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    with db() as conn:
-        conn.execute("INSERT INTO suggestions(user_id, username, text, ts) VALUES (?,?,?,?)",
-                     (msg.from_user.id, msg.from_user.username or "",
-                      msg.text, datetime.now().isoformat()))
-        conn.commit()
+    dbq("INSERT INTO suggestions(user_id, username, text, ts) VALUES (?,?,?,?)",
+        (msg.from_user.id, msg.from_user.username or "", msg.text, datetime.now().isoformat()))
     await msg.answer("✅ Предложение отправлено, спасибо!", reply_markup=main_menu_kb())
     # уведомление админу
     try:
@@ -838,10 +983,7 @@ async def cb_dl_logs(cb: CallbackQuery, bot: Bot):
 async def cb_admin_suggestions(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID:
         return
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT username, text, ts FROM suggestions ORDER BY ts DESC LIMIT 20"
-        ).fetchall()
+    rows = dbq("SELECT username, text, ts FROM suggestions ORDER BY ts DESC LIMIT 20", fetch=True) or []
     if not rows:
         await cb.answer("Предложений нет", show_alert=True)
         return
@@ -884,7 +1026,7 @@ async def cb_set_service(cb: CallbackQuery):
 async def cb_admin_music_log(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID:
         return
-    with db() as conn:
+    with sqlite3.connect("music.db") as conn:
         rows = conn.execute(
             "SELECT ts, first_name, username, title, artist FROM history ORDER BY ts DESC LIMIT 30"
         ).fetchall()
